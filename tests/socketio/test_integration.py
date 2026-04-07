@@ -19,6 +19,7 @@ class TestSocketIOIntegration:
         mock_converter = MagicMock()
         mock_converter.input_sampling_rate = 44100
         mock_converter.block_time = 0.18
+        mock_converter.block_frame = 7938
         return mock_converter
 
     def test_max_client_connection_limit_integration(self, mock_voice_converter):
