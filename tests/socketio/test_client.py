@@ -1,4 +1,4 @@
-"""Tests for Socket.IO client connection error handling."""
+"""Tests for Socket.IO client connection error handling and queue behavior."""
 
 from unittest.mock import patch
 
@@ -191,3 +191,64 @@ class TestClientConnectionErrors:
         )
         assert client_module.connection_error_details["client_chunk_size"] == 1000
         assert client_module.connection_error_details["expected_chunk_size"] == 7938
+
+
+class TestQueueDraining:
+    """Test cases for queue size limiting to prevent unbounded latency."""
+
+    def setup_method(self):
+        """Clear queues before each test."""
+        while not client_module.play_q.empty():
+            client_module.play_q.get_nowait()
+        while not client_module.send_q.empty():
+            client_module.send_q.get_nowait()
+
+    def test_max_queue_size_constant_exists(self):
+        """Test that MAX_QUEUE_SIZE constant is defined."""
+        assert hasattr(client_module, "MAX_QUEUE_SIZE")
+        assert client_module.MAX_QUEUE_SIZE == 1
+
+    def test_play_queue_drains_stale_chunks(self):
+        """Test that stale chunks are drained when play_q exceeds limit."""
+        # Fill play_q with 5 chunks
+        for i in range(5):
+            client_module.play_q.put(f"chunk_{i}".encode())
+
+        # Simulate consumer: get first, then drain if over limit
+        chunk = client_module.play_q.get()
+        assert client_module.play_q.qsize() > client_module.MAX_QUEUE_SIZE
+
+        skipped = 0
+        while not client_module.play_q.empty():
+            chunk = client_module.play_q.get()
+            skipped += 1
+
+        assert skipped == 4
+        assert chunk == b"chunk_4"
+        assert client_module.play_q.empty()
+
+    def test_send_queue_drains_stale_chunks(self):
+        """Test that stale chunks are drained when send_q exceeds limit."""
+        # Fill send_q with 5 chunks
+        for i in range(5):
+            client_module.send_q.put(f"chunk_{i}".encode())
+
+        # Simulate consumer: get first, then drain if over limit
+        chunk = client_module.send_q.get()
+        assert client_module.send_q.qsize() > client_module.MAX_QUEUE_SIZE
+
+        skipped = 0
+        while not client_module.send_q.empty():
+            chunk = client_module.send_q.get()
+            skipped += 1
+
+        assert skipped == 4
+        assert chunk == b"chunk_4"
+        assert client_module.send_q.empty()
+
+    def test_no_drain_when_queue_within_limit(self):
+        """Test that no draining occurs when queue is within MAX_QUEUE_SIZE."""
+        client_module.play_q.put(b"only_chunk")
+        chunk = client_module.play_q.get()
+        assert client_module.play_q.qsize() <= client_module.MAX_QUEUE_SIZE
+        assert chunk == b"only_chunk"

@@ -50,6 +50,7 @@ SAMPLE_RATE = 44100
 CHANNELS = 1
 DTYPE = "int16"
 CHUNK_SIZE = 7938  # Number of frames
+MAX_QUEUE_SIZE = 1  # Maximum queued chunks before draining stale audio
 
 # Global queues and client
 play_q: queue.Queue[bytes] = queue.Queue()  # Server -> Speaker
@@ -129,6 +130,14 @@ def send_loop() -> None:
     """Background thread to send microphone data to server."""
     while True:
         data = send_q.get()
+        if send_q.qsize() > MAX_QUEUE_SIZE:
+            skipped = 0
+            while not send_q.empty():
+                data = send_q.get()
+                skipped += 1
+            logger.warning(
+                "⚠️ Skipped %d stale send chunks to reduce latency", skipped
+            )
         if sio.connected:
             try:
                 logger.debug("📤 Sending audio packet (size: %d bytes)", len(data))
@@ -247,6 +256,15 @@ def main() -> None:
             try:
                 while True:
                     chunk = play_q.get()
+                    if play_q.qsize() > MAX_QUEUE_SIZE:
+                        skipped = 0
+                        while not play_q.empty():
+                            chunk = play_q.get()
+                            skipped += 1
+                        logger.warning(
+                            "⚠️ Skipped %d stale playback chunks to reduce latency",
+                            skipped,
+                        )
                     outstream.write(chunk)
             except KeyboardInterrupt:
                 logger.info("⏹️ Stopped by user")
