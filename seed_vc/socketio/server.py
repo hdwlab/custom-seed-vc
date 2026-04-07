@@ -124,9 +124,7 @@ async def connect(
                 # Fallback: use zc-aligned formula matching model._init_buffers()
                 block_time = 0.18
                 zc = client_sample_rate // 50
-                expected_chunk_size = (
-                    int(np.round(block_time * client_sample_rate / zc)) * zc
-                )
+                expected_chunk_size = int(np.round(block_time * client_sample_rate / zc)) * zc
 
             if client_chunk_size != expected_chunk_size:
                 logger.error(

@@ -135,9 +135,7 @@ def send_loop() -> None:
             while not send_q.empty():
                 data = send_q.get()
                 skipped += 1
-            logger.warning(
-                "⚠️ Skipped %d stale send chunks to reduce latency", skipped
-            )
+            logger.warning("⚠️ Skipped %d stale send chunks to reduce latency", skipped)
         if sio.connected:
             try:
                 logger.debug("📤 Sending audio packet (size: %d bytes)", len(data))
