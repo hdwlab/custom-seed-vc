@@ -175,6 +175,35 @@ class TestVoiceConverter:
         # Verify outdata was modified (should not be all zeros)
         assert not np.allclose(outdata, 0)
 
+    @pytest.mark.slow
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU not available")
+    def test_init_buffers_resets_vad_state(self):
+        """Test that _init_buffers resets VAD state when block_time changes."""
+        converter = VoiceConverter(
+            input_sampling_rate=44100,
+            block_time=0.18,
+            diffusion_steps=1,
+        )
+
+        # Simulate stale VAD state from a previous session
+        converter.vad_cache = {"some_key": "stale_value"}
+        converter.vad_speech_detected = True
+        converter.set_speech_detected_false_at_end_flag = True
+        old_vad_chunk_size = converter.vad_chunk_size
+
+        # Change block_time and reinitialize (mimics API parameter update)
+        converter.block_time = 0.12
+        converter._init_buffers()
+
+        # VAD state should be fully reset
+        assert converter.vad_cache == {}
+        assert converter.vad_speech_detected is False
+        assert converter.set_speech_detected_false_at_end_flag is False
+        # vad_chunk_size should be recalculated for new block_time
+        expected_vad_chunk_size = min(500, 1000 * 0.12)  # = 120
+        assert converter.vad_chunk_size == expected_vad_chunk_size
+        assert converter.vad_chunk_size != old_vad_chunk_size
+
     def test_voice_converter_basic_initialization(self):
         """Test basic VoiceConverter initialization without GPU requirements."""
         # Test basic initialization
