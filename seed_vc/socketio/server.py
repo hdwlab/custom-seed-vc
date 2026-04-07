@@ -115,13 +115,18 @@ async def connect(
         client_sample_rate = auth.get("sample_rate")
 
         if client_chunk_size is not None and client_sample_rate is not None:
-            # Calculate expected chunk size based on server's block_time
+            # Calculate expected chunk size based on converter's block_frame
+            # Use the same zc-aligned formula as model._init_buffers()
             if global_converter is not None:
                 block_time = global_converter.block_time
+                expected_chunk_size = global_converter.block_frame
             else:
-                # Fallback to default value if converter not yet initialized
+                # Fallback: use zc-aligned formula matching model._init_buffers()
                 block_time = 0.18
-            expected_chunk_size = int(block_time * client_sample_rate)
+                zc = client_sample_rate // 50
+                expected_chunk_size = (
+                    int(np.round(block_time * client_sample_rate / zc)) * zc
+                )
 
             if client_chunk_size != expected_chunk_size:
                 logger.error(
