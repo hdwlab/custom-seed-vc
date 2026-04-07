@@ -126,6 +126,7 @@ class TestServerConnectionLimits:
         with patch("seed_vc.socketio.server.MAX_CLIENT", 1):
             mock_converter = MagicMock()
             mock_converter.block_time = 0.18
+            mock_converter.block_frame = 7938
             with patch("seed_vc.socketio.server.global_converter", mock_converter):
                 # Client with invalid chunk size should be rejected
                 auth = {"chunk_size": 1000, "sample_rate": 44100}
@@ -136,7 +137,28 @@ class TestServerConnectionLimits:
                 error_data = exc_info.value.args[0]
                 assert error_data["error"] == ConnectionErrorType.CHUNK_SIZE_MISMATCH.value
                 assert error_data["client_chunk_size"] == 1000
-                assert error_data["expected_chunk_size"] == 7938  # 0.18 * 44100
+                assert error_data["expected_chunk_size"] == 7938
+
+    def test_chunk_size_uses_zc_aligned_block_frame(self):
+        """Test that chunk size validation uses zc-aligned block_frame from converter."""
+        with patch("seed_vc.socketio.server.MAX_CLIENT", 1):
+            mock_converter = MagicMock()
+            mock_converter.block_time = 0.25
+            # zc-aligned: int(round(0.25 * 44100 / 882)) * 882 = round(12.5) * 882 = 10584
+            mock_converter.block_frame = 10584
+            with patch("seed_vc.socketio.server.global_converter", mock_converter):
+                # Client sending zc-aligned chunk size should be accepted
+                auth = {"chunk_size": 10584, "sample_rate": 44100}
+                result = asyncio.run(connect("client_aligned", {}, auth))
+                assert result is True
+                asyncio.run(disconnect("client_aligned"))
+
+                # Client sending simple int(0.25*44100)=11025 should be rejected
+                auth_wrong = {"chunk_size": 11025, "sample_rate": 44100}
+                with pytest.raises(SocketIOConnectionRefused) as exc_info:
+                    asyncio.run(connect("client_wrong", {}, auth_wrong))
+                error_data = exc_info.value.args[0]
+                assert error_data["expected_chunk_size"] == 10584
 
     def test_client_disconnect_reduces_connection_count(self):
         """Test that client disconnection properly reduces the connection count."""

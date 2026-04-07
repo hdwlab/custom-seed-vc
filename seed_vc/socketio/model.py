@@ -367,6 +367,12 @@ class VoiceConverter:
         else:
             self.resampler2 = None
 
+        # Reset VAD state for new buffer configuration
+        self.vad_cache = {}
+        self.vad_chunk_size = min(500, 1000 * self.block_time)
+        self.vad_speech_detected = False
+        self.set_speech_detected_false_at_end_flag = False
+
     def _load_models(
         self,
     ) -> Tuple[
