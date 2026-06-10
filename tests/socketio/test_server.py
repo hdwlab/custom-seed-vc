@@ -213,3 +213,78 @@ class TestServerConnectionLimits:
                 assert result2 is True
                 assert result3 is True
                 assert len(client_converters) == 3
+
+
+class TestLoadConverterConfig:
+    """Test cases for loading VoiceConverter config from YAML."""
+
+    def test_none_returns_empty_dict(self):
+        """Test that None config path returns an empty dict."""
+        from seed_vc.socketio.server import load_converter_config
+
+        assert load_converter_config(None) == {}
+
+    def test_yaml_values_loaded(self, tmp_path):
+        """Test that YAML values are loaded as a dict."""
+        from seed_vc.socketio.server import load_converter_config
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("block_time: 0.12\ndiffusion_steps: 6\nuse_vad: false\n")
+
+        config = load_converter_config(str(config_path))
+
+        assert config == {"block_time": 0.12, "diffusion_steps": 6, "use_vad": False}
+
+    def test_empty_file_returns_empty_dict(self, tmp_path):
+        """Test that an empty YAML file returns an empty dict."""
+        from seed_vc.socketio.server import load_converter_config
+
+        config_path = tmp_path / "empty.yaml"
+        config_path.write_text("")
+
+        assert load_converter_config(str(config_path)) == {}
+
+    def test_missing_file_raises(self):
+        """Test that a missing config file raises FileNotFoundError."""
+        from seed_vc.socketio.server import load_converter_config
+
+        with pytest.raises(FileNotFoundError):
+            load_converter_config("/no/such/config.yaml")
+
+
+class TestInitializeGlobalConverterWithConfig:
+    """Test cases for config overrides in initialize_global_converter."""
+
+    def test_config_overrides_defaults(self, monkeypatch):
+        """Test that YAML-provided kwargs override the hardcoded defaults."""
+        from seed_vc.socketio import server
+
+        monkeypatch.setattr(server, "global_converter", None)
+        with patch("seed_vc.socketio.server.VoiceConverter") as mock_vc:
+            mock_vc.return_value = MagicMock()
+            result = server.initialize_global_converter(
+                log_level="INFO",
+                converter_kwargs={"block_time": 0.12, "use_vad": False},
+            )
+
+        assert result is not None
+        _args, kwargs = mock_vc.call_args
+        assert kwargs["block_time"] == 0.12
+        assert kwargs["use_vad"] is False
+        # Unspecified parameters keep their defaults
+        assert kwargs["diffusion_steps"] == 10
+        assert kwargs["input_sampling_rate"] == 44100
+
+    def test_defaults_used_without_config(self, monkeypatch):
+        """Test that defaults are used when no config is provided."""
+        from seed_vc.socketio import server
+
+        monkeypatch.setattr(server, "global_converter", None)
+        with patch("seed_vc.socketio.server.VoiceConverter") as mock_vc:
+            mock_vc.return_value = MagicMock()
+            server.initialize_global_converter(log_level="DEBUG")
+
+        _args, kwargs = mock_vc.call_args
+        assert kwargs["block_time"] == 0.18
+        assert kwargs["use_vad"] is True
+        assert kwargs["log_level"] == "DEBUG"

@@ -25,6 +25,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import socketio
 import uvicorn
+import yaml
 from fastapi import FastAPI
 from socketio.exceptions import ConnectionRefusedError as SocketIOConnectionRefused
 
@@ -190,8 +191,38 @@ async def disconnect(sid: str) -> None:
         logger.info("📊 Current connected clients: %d/%d", current_clients, MAX_CLIENT)
 
 
-def initialize_global_converter(log_level: str = "INFO") -> Optional[VoiceConverter]:
+def load_converter_config(config_path: Optional[str]) -> Dict[str, Any]:
+    """Load VoiceConverter keyword arguments from a YAML file.
+
+    The YAML keys map directly to VoiceConverter.__init__ keyword arguments
+    (e.g. block_time, diffusion_steps, reference_wav_path).
+
+    Args:
+        config_path: Path to the YAML config file. If None, returns an empty dict.
+
+    Returns:
+        Dictionary of VoiceConverter keyword arguments.
+
+    Raises:
+        FileNotFoundError: If config_path does not exist.
+    """
+    if config_path is None:
+        return {}
+    with open(config_path) as f:
+        data = yaml.safe_load(f)
+    return data if data is not None else {}
+
+
+def initialize_global_converter(
+    log_level: str = "INFO",
+    converter_kwargs: Optional[Dict[str, Any]] = None,
+) -> Optional[VoiceConverter]:
     """Initialize the global VoiceConverter instance.
+
+    Args:
+        log_level: Logging level for the converter.
+        converter_kwargs: Optional VoiceConverter keyword arguments
+            (e.g. loaded from a YAML config) overriding the defaults.
 
     Returns:
         VoiceConverter instance or None if initialization failed.
@@ -201,21 +232,25 @@ def initialize_global_converter(log_level: str = "INFO") -> Optional[VoiceConver
     if global_converter is not None:
         return global_converter
 
+    kwargs: Dict[str, Any] = {
+        "input_sampling_rate": 44100,  # Match client's sample rate (44.1kHz)
+        "block_time": 0.18,  # 180ms blocks
+        "crossfade_time": 0.04,
+        "extra_time_ce": 2.5,
+        "extra_time": 0.5,
+        "extra_time_right": 0.02,
+        "diffusion_steps": 10,
+        "max_prompt_length": 3.0,
+        "inference_cfg_rate": 0.7,
+        "use_vad": True,
+        "log_level": log_level,
+    }
+    if converter_kwargs:
+        kwargs.update(converter_kwargs)
+
     try:
         logger.info("🔄 Initializing global VoiceConverter...")
-        global_converter = VoiceConverter(
-            input_sampling_rate=44100,  # Match client's sample rate (44.1kHz)
-            block_time=0.18,  # 180ms blocks
-            crossfade_time=0.04,
-            extra_time_ce=2.5,
-            extra_time=0.5,
-            extra_time_right=0.02,
-            diffusion_steps=10,
-            max_prompt_length=3.0,
-            inference_cfg_rate=0.7,
-            use_vad=True,
-            log_level=log_level,
-        )
+        global_converter = VoiceConverter(**kwargs)
         logger.info("✅ Global VoiceConverter ready!")
         return global_converter
 
@@ -345,6 +380,12 @@ def main() -> None:
         help="Port number",
     )
     parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to a YAML file with VoiceConverter keyword arguments "
+        "(e.g. block_time, diffusion_steps, reference_wav_path)",
+    )
+    parser.add_argument(
         "--allowed-audio-dirs",
         type=str,
         nargs="*",
@@ -368,7 +409,11 @@ def main() -> None:
     logger.info("🎙️ Starting voice conversion server on %s:%s ...", args.host, args.port)
 
     # Initialize the global converter before starting the server
-    if initialize_global_converter(log_level=args.log_level) is None:
+    converter_kwargs = load_converter_config(args.config)
+    if (
+        initialize_global_converter(log_level=args.log_level, converter_kwargs=converter_kwargs)
+        is None
+    ):
         logger.error("❌ Failed to initialize VoiceConverter. Exiting...")
         return
 
