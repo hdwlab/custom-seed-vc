@@ -30,6 +30,11 @@ class VoiceConverterMock(VoiceConverter):
         """Override to skip buffer initialization."""
         # Set minimal required attributes
         self.model_set = [{"sampling_rate": 16000}]
+        # Set zc-aligned block_frame using the same formula as the real _init_buffers()
+        self.zc = self.input_sampling_rate // 50
+        self.block_frame = (
+            int(round(self.block_time * self.input_sampling_rate / self.zc)) * self.zc
+        )
 
 
 @pytest.fixture
@@ -63,6 +68,21 @@ def test_client(api_router):
     app = FastAPI()
     app.include_router(api_router.api_router, prefix="/api/v1")
     return TestClient(app)
+
+
+class TestConfigEndpoint:
+    """Test the server audio config endpoint."""
+
+    def test_get_config_returns_audio_configuration(self, test_client):
+        """Test that /config returns the server audio configuration for client auto-setup."""
+        response = test_client.get("/api/v1/config")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["input_sampling_rate"] == 44100
+        assert data["block_time"] == 0.18
+        # chunk_size must match the zc-aligned block_frame used in connection validation
+        assert data["chunk_size"] == 7938
 
 
 class TestConversionModeEndpoint:

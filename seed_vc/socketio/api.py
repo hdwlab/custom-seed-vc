@@ -157,6 +157,11 @@ class APIRouterVCModel:
         """Set up API routes. Can be overridden in subclasses."""
         # Define your API routes here
         self.api_router.add_api_route(
+            "/config",
+            self.get_config,
+            methods=["GET"],
+        )
+        self.api_router.add_api_route(
             "/reference",
             self.update_reference_audio,
             methods=["POST"],
@@ -223,6 +228,22 @@ class APIRouterVCModel:
 
         except (OSError, ValueError) as e:
             raise HTTPException(status_code=400, detail=f"Invalid file path: {str(e)}") from e
+
+    def get_config(self) -> JSONResponse:
+        """Return server audio configuration for client auto-setup.
+
+        Returns:
+            JSONResponse with sampling rate, block time, and chunk size.
+            The chunk size is the zc-aligned block_frame used in connection validation.
+        """
+        return JSONResponse(
+            content={
+                "input_sampling_rate": self.model.input_sampling_rate,
+                "block_time": self.model.block_time,
+                "chunk_size": self.model.block_frame,
+            },
+            status_code=200,
+        )
 
     def update_reference_audio(self, request: ReferenceAudioRequest) -> JSONResponse:
         """Update the reference audio for voice conversion.
