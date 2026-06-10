@@ -5,7 +5,7 @@ This repostitory contains a custom implementation of the [Plachtaa/seed-vc](http
 ## Requirements
 
 - Python 3.10+
-- Poetry 2.0+
+- uv 0.10+
 - Nvidia Driver with CUDA 11.8 support
 - Nvidia GPU
 - Docker (optional)
@@ -14,7 +14,7 @@ This repository is tested on the following environment:
 
 - Ubuntu 24.04
 - Python 3.10.16
-- Poetry 2.1.2
+- uv 0.10.6
 - Nvidia Driver 570.133.20
 - Nvidia RTX6000 & L40S
 - Docker 28.0.4

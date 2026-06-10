@@ -10,23 +10,21 @@ help: ## Show this help
 default: help
 
 .venv:
-	poetry config virtualenvs.create true --local
-	poetry config virtualenvs.in-project true --local
-	poetry install
+	uv sync
 
 install: .venv
 
 .PHONY: lint
 lint: .venv		## Run the linter
-	poetry run ruff check .
+	uv run ruff check .
 
 .PHONY: test
 test: .venv		## Run pytest
-	poetry run pytest tests
+	uv run pytest tests
 
 .PHONY: format
 format: .venv	## Run the formatter
-	poetry run ruff format .
+	uv run ruff format .
 
 .PHONY: clean
 clean:		## Clean up the project

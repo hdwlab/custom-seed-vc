@@ -80,11 +80,11 @@ fi
 
 if [ "${stage}" -le 1 ] && [ "${stop_stage}" -ge 1 ]; then
     log "Stage 1: Data validation"
-    poetry run python local/validate_dataset.py \
+    uv run python local/validate_dataset.py \
         --config "${train_config}" \
         "${train_dataset_dir}"
     log "Data validation for training dataset completed successfully."
-    poetry run python local/validate_dataset.py \
+    uv run python local/validate_dataset.py \
         --config "${train_config}" \
         "${test_dataset_dir}"
     log "Data validation for test dataset completed successfully."
@@ -93,7 +93,7 @@ fi
 if [ "${stage}" -le 2 ] && [ "${stop_stage}" -ge 2 ]; then
     log "Stage 2: Training"
     log "Training start. See logs in the run directory: runs/${run_name}"
-    poetry run python -m seed_vc.bin.train \
+    uv run python -m seed_vc.bin.train \
         --config "${train_config}" \
         --dataset-dir "${train_dataset_dir}" \
         --run-name "${run_name}"
@@ -123,7 +123,7 @@ if [ "${stage}" -le 3 ] && [ "${stop_stage}" -ge 3 ]; then
         exit 1
     fi
     # shellcheck disable=SC2086
-    poetry run python -m seed_vc.bin.inference \
+    uv run python -m seed_vc.bin.inference \
         ${inference_opts} \
         --source "${test_dataset_dir}" \
         --target "${reference_audio_path}" \
@@ -136,14 +136,14 @@ fi
 if [ "${stage}" -le 4 ] && [ "${stop_stage}" -ge 4 ]; then
     log "Stage 4: Evaluation"
     log "Evaluating converted audio against the reference audio..."
-    poetry run python -m local.eval \
+    uv run python -m local.eval \
         --converted-dir "${output_dir}" \
         --reference "${reference_audio_path}" \
         --output-dir "${output_dir}/eval/converted"
     log "Evaluation of converted audio completed. Results saved to ${output_dir}/eval/converted"
 
     log "Evaluating original audio against the reference audio..."
-    poetry run python -m local.eval \
+    uv run python -m local.eval \
         --converted-dir "${test_dataset_dir}" \
         --reference "${reference_audio_path}" \
         --output-dir "${output_dir}/eval/original"

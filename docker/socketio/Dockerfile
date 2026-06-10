@@ -25,23 +25,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpulse-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Poetry
-ENV POETRY_HOME="/opt/poetry"
-ENV POETRY_CACHE_DIR="/opt/poetry/cache"
-ENV POETRY_VENV_IN_PROJECT=1
-ENV POETRY_NO_INTERACTION=1
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:0.10.6 /uv /uvx /usr/local/bin/
+ENV UV_LINK_MODE=copy
 
-RUN curl -sSL https://install.python-poetry.org | python3 -
-ENV PATH="$POETRY_HOME/bin:$PATH"
-
-# Copy poetry configuration files
-COPY pyproject.toml poetry.lock poetry.toml ./
-# Copy README.md (required by poetry for package installation)
+# Copy uv configuration files
+COPY pyproject.toml uv.lock ./
+# Copy README.md (required for package metadata)
 COPY README.md ./
 
-# Configure poetry and install dependencies
-RUN poetry config virtualenvs.create false \
-    && poetry install --only=main,client --without dev --no-root
+# Install dependencies (main + client groups, without dev)
+RUN uv sync --locked --no-dev --no-install-project
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Copy source code
 COPY seed_vc/ ./seed_vc/
@@ -58,4 +53,4 @@ EXPOSE 5000
 ENV LOG_LEVEL=INFO
 
 # Command to run the server
-CMD poetry run python -m seed_vc.socketio.server --host 0.0.0.0 --port 5000 --log-level $LOG_LEVEL
+CMD python -m seed_vc.socketio.server --host 0.0.0.0 --port 5000 --log-level $LOG_LEVEL
