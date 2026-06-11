@@ -95,6 +95,13 @@ class TestRTFMonitoring:
 
         mock_converter.audio_callback = slow_audio_callback
 
+        # Register the client so that the chunk is not dropped
+        from seed_vc.socketio import server as server_module
+        from seed_vc.socketio.runtime import ServerRuntimeCoordinator
+
+        server_module.runtime = ServerRuntimeCoordinator()
+        server_module.runtime.try_register_client("test_client", max_clients=1)
+
         # Mock global state and logger
         with patch("seed_vc.socketio.server.global_converter", mock_converter):
             with patch("seed_vc.socketio.server.sio") as mock_sio:

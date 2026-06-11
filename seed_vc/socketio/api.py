@@ -17,18 +17,23 @@
 """API for VoiceConverter model with FastAPI integration."""
 
 import logging
+import tempfile
 import threading
+from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, NoReturn, Optional
 
 import librosa
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi.responses import JSONResponse, Response
 
 from seed_vc.socketio.model import ConversionMode, VoiceConverter
+from seed_vc.socketio.runtime import ServerRuntimeCoordinator
 from seed_vc.socketio.schemas import (
+    OFFLINE_BUSY_MESSAGE,
     ConversionModeRequest,
+    FileConversionRequest,
     ModelParametersRequest,
     ModelReloadRequest,
     ReferenceAudioRequest,
@@ -44,6 +49,8 @@ if not logger.handlers:
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
+
+MAX_UPLOAD_SIZE_BYTES = 25 * 1024 * 1024  # 25 MB
 
 
 def _get_connected_clients_count() -> int:
@@ -66,6 +73,22 @@ def _get_connected_clients_count() -> int:
         logger.warning("⚠️ API: Could not import server module: %s", e)
         # If server module is not available, assume no clients
         return 0
+
+
+def _connected_clients_http_exception(connected_count: int) -> HTTPException:
+    """Return the standard 409 response for active realtime clients.
+
+    Args:
+        connected_count: Number of currently connected clients.
+    """
+    return HTTPException(
+        status_code=409,  # Conflict
+        detail=(
+            f"Cannot perform this operation while {connected_count} "
+            "client(s) are connected. Please disconnect all clients first "
+            "and try again."
+        ),
+    )
 
 
 def require_no_connected_clients_method(func: Callable) -> Callable:
@@ -97,14 +120,7 @@ def require_no_connected_clients_method(func: Callable) -> Callable:
                 logger.error(
                     "❌ API: Blocking %s - %d client(s) connected", func.__name__, connected_count
                 )
-                raise HTTPException(
-                    status_code=409,  # Conflict
-                    detail=(
-                        f"Cannot perform this operation while {connected_count} "
-                        "client(s) are connected. Please disconnect all clients first"
-                        "and try again."
-                    ),
-                )
+                raise _connected_clients_http_exception(connected_count)
             logger.info("✅ API: Allowing %s - no clients connected", func.__name__)
         else:
             logger.warning("⚠️ API: No client count checker provided - allowing %s", func.__name__)
@@ -123,6 +139,7 @@ class APIRouterVCModel:
         allowed_audio_dirs: Optional[list[str]] = None,
         log_level: str = "INFO",
         client_count_checker: Optional[Callable[[], int]] = None,
+        runtime: Optional[ServerRuntimeCoordinator] = None,
     ) -> None:
         """Initialize the API router with the given VoiceConverter model.
 
@@ -132,7 +149,10 @@ class APIRouterVCModel:
                 If None, defaults to ["assets/examples/reference"]
             log_level (str): Logging level for the API. Defaults to "INFO".
             client_count_checker: Function to get current client count. If None,
-                no client connection checking will be performed.
+                falls back to the runtime's client count when a runtime is given,
+                otherwise no client connection checking will be performed.
+            runtime: Runtime state shared with the Socket.IO event handlers.
+                If None, a private coordinator is created.
         """
         # Configure logger level for this instance
         numeric_level = getattr(logging, log_level.upper(), None)
@@ -144,7 +164,9 @@ class APIRouterVCModel:
         self.api_router = APIRouter()
         self._init_routes()
         self.model = model
-        self.model_lock = threading.Lock()
+        self.runtime = runtime or ServerRuntimeCoordinator()
+        if client_count_checker is None and runtime is not None:
+            client_count_checker = runtime.client_count
         self.client_count_checker = client_count_checker
 
         # Set allowed directories for audio files
@@ -152,6 +174,11 @@ class APIRouterVCModel:
             self.allowed_audio_dirs = ["assets/examples/reference"]
         else:
             self.allowed_audio_dirs = allowed_audio_dirs
+
+    @property
+    def model_lock(self) -> threading.Lock:
+        """Lock guarding model access, shared with the Socket.IO handlers."""
+        return self.runtime.model_lock
 
     def _init_routes(self) -> None:
         """Set up API routes. Can be overridden in subclasses."""
@@ -181,6 +208,36 @@ class APIRouterVCModel:
             self.reload_model,
             methods=["POST"],
         )
+        self.api_router.add_api_route(
+            "/convert",
+            self.convert_file,
+            methods=["POST"],
+        )
+        self.api_router.add_api_route(
+            "/convert/upload",
+            self.convert_file_upload,
+            methods=["POST"],
+        )
+
+    def _is_in_allowed_dirs(self, resolved_path: Path) -> bool:
+        """Check whether the resolved path is within allowed directories.
+
+        Args:
+            resolved_path: The resolved absolute path to check.
+
+        Returns:
+            True if the path is within one of the allowed directories.
+        """
+        for allowed_dir in self.allowed_audio_dirs:
+            allowed_path = Path(allowed_dir).resolve()
+            try:
+                # Check if the file is within the allowed directory
+                resolved_path.relative_to(allowed_path)
+                return True
+            except ValueError:
+                # Not within this allowed directory, continue checking
+                continue
+        return False
 
     def _validate_file_path(self, file_path: str) -> str:
         """Validate and resolve file path to prevent directory traversal attacks.
@@ -202,20 +259,7 @@ class APIRouterVCModel:
             if not resolved_path.exists():
                 raise HTTPException(status_code=404, detail=f"Audio file not found: {file_path}")
 
-            # Check if the resolved path is within allowed directories
-            is_allowed = False
-            for allowed_dir in self.allowed_audio_dirs:
-                allowed_path = Path(allowed_dir).resolve()
-                try:
-                    # Check if the file is within the allowed directory
-                    resolved_path.relative_to(allowed_path)
-                    is_allowed = True
-                    break
-                except ValueError:
-                    # Not within this allowed directory, continue checking
-                    continue
-
-            if not is_allowed:
+            if not self._is_in_allowed_dirs(resolved_path):
                 raise HTTPException(
                     status_code=403,
                     detail=(
@@ -228,6 +272,41 @@ class APIRouterVCModel:
 
         except (OSError, ValueError) as e:
             raise HTTPException(status_code=400, detail=f"Invalid file path: {str(e)}") from e
+
+    def _validate_output_path(self, file_path: str) -> str:
+        """Validate and resolve output file path for writing.
+
+        Args:
+            file_path: The output file path to validate.
+
+        Returns:
+            The resolved absolute path.
+
+        Raises:
+            HTTPException: If the parent directory does not exist or the path is not allowed.
+        """
+        try:
+            resolved_path = Path(file_path).resolve()
+
+            if not resolved_path.parent.exists():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Output directory does not exist: {resolved_path.parent}",
+                )
+
+            if not self._is_in_allowed_dirs(resolved_path):
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        f"Access denied: File must be in one of the allowed directories: "
+                        f"{self.allowed_audio_dirs}"
+                    ),
+                )
+
+            return str(resolved_path)
+
+        except (OSError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=f"Invalid output path: {str(e)}") from e
 
     def get_config(self) -> JSONResponse:
         """Return server audio configuration for client auto-setup.
@@ -263,7 +342,7 @@ class APIRouterVCModel:
         validated_file_path = self._validate_file_path(request.file_path)
 
         try:
-            # Load the new reference audio
+            # Load outside the lock so realtime audio processing is not stalled
             reference_wav, _ = librosa.load(
                 validated_file_path,
                 sr=self.model.model_set[-1]["sampling_rate"],
@@ -271,14 +350,7 @@ class APIRouterVCModel:
 
             # Thread-safe update of model's reference audio and cache
             with self.model_lock:
-                self.model.reference_wav_path = validated_file_path
-                self.model.reference_wav = reference_wav
-
-                # Clear cached values to force regeneration
-                self.model.prompt_condition = None
-                self.model.mel2 = None
-                self.model.style2 = None
-                self.model.reference_wav_name = ""
+                self._apply_reference_audio(validated_file_path, reference_wav)
 
             duration = len(reference_wav) / self.model.model_set[-1]["sampling_rate"]
             self.logger.info("✅ API: Reference audio updated successfully (%.2fs)", duration)
@@ -298,6 +370,217 @@ class APIRouterVCModel:
             raise HTTPException(
                 status_code=500, detail=f"Failed to load audio file: {str(e)}"
             ) from e
+
+    def _clear_reference_cache(self) -> None:
+        """Clear the model's cached reference values to force regeneration.
+
+        Must be called while holding self.model_lock.
+        """
+        self.model.prompt_condition = None
+        self.model.mel2 = None
+        self.model.style2 = None
+        self.model.reference_wav_name = ""
+
+    def _apply_reference_audio(self, file_path, reference_wav) -> None:
+        """Update the model's reference state and clear dependent caches.
+
+        Must be called while holding self.model_lock.
+
+        Args:
+            file_path: Path to the reference audio file.
+            reference_wav: Reference waveform loaded at the model's sampling rate.
+        """
+        self.model.reference_wav_path = file_path
+        self.model.reference_wav = reference_wav
+        self._clear_reference_cache()
+
+    def _set_reference_audio(self, file_path: str) -> None:
+        """Load reference audio and update the model's reference state and caches.
+
+        Must be called while holding self.model_lock.
+
+        Args:
+            file_path: Path to the reference audio file.
+        """
+        reference_wav, _ = librosa.load(
+            file_path,
+            sr=self.model.model_set[-1]["sampling_rate"],
+        )
+        self._apply_reference_audio(file_path, reference_wav)
+
+    @staticmethod
+    def _raise_conversion_error(error: Exception) -> NoReturn:
+        """Translate known conversion errors into appropriate HTTP responses.
+
+        Args:
+            error: The exception raised during conversion.
+
+        Raises:
+            HTTPException: With a status code matching the error type.
+        """
+        detail = str(error)
+        if isinstance(error, ValueError):
+            raise HTTPException(status_code=400, detail=detail) from error
+        if isinstance(error, RuntimeError) and "Reference audio not set" in detail:
+            raise HTTPException(status_code=400, detail=detail) from error
+        raise HTTPException(status_code=500, detail=f"File conversion failed: {detail}") from error
+
+    def _raise_offline_exclusion_error(self) -> NoReturn:
+        """Raise the appropriate 409 error for offline conversion conflicts.
+
+        Raises:
+            HTTPException: With a message matching the conflicting state.
+        """
+        connected_count = (
+            self.client_count_checker() if self.client_count_checker is not None else 0
+        )
+        if connected_count > 0:
+            raise _connected_clients_http_exception(connected_count)
+        raise HTTPException(status_code=409, detail=OFFLINE_BUSY_MESSAGE)
+
+    @contextmanager
+    def _offline_model_session(self) -> Iterator[None]:
+        """Reserve exclusive offline access and lock the model for a conversion.
+
+        While the reservation is held, new realtime client connections and
+        other offline conversion jobs are rejected.
+
+        Raises:
+            HTTPException: If realtime clients are connected or another
+                offline job is in progress.
+        """
+        # Reject first based on the external client count checker, which is
+        # the only exclusion source when the router is used without a shared
+        # runtime (the runtime check below covers the attached case atomically)
+        connected_count = (
+            self.client_count_checker() if self.client_count_checker is not None else 0
+        )
+        if connected_count > 0:
+            raise _connected_clients_http_exception(connected_count)
+        if not self.runtime.try_begin_offline_job():
+            self._raise_offline_exclusion_error()
+        try:
+            with self.model_lock:
+                yield
+        finally:
+            self.runtime.finish_offline_job()
+
+    def convert_file(self, request: FileConversionRequest) -> JSONResponse:
+        """Convert an audio file offline using the voice conversion model.
+
+        Args:
+            request: Request containing input and output file paths.
+
+        Returns:
+            JSONResponse with conversion metadata.
+
+        Raises:
+            HTTPException: If validation fails or the conversion fails.
+        """
+        self.logger.info("🎵 API: Convert file - %s", request.input_path)
+        validated_input = self._validate_file_path(request.input_path)
+        validated_output = self._validate_output_path(request.output_path)
+
+        try:
+            with self._offline_model_session():
+                result = self.model.convert_file(validated_input, validated_output)
+            self.logger.info("✅ API: File conversion completed - %s", validated_output)
+            return JSONResponse(content=result, status_code=200)
+        except HTTPException:
+            raise
+        except Exception as e:
+            self.logger.error("❌ API: File conversion failed: %s", str(e))
+            self._raise_conversion_error(e)
+
+    def convert_file_upload(
+        self,
+        input_file: UploadFile,
+        reference_file: Optional[UploadFile] = None,
+    ) -> Response:
+        """Convert an uploaded audio file and return the converted WAV binary.
+
+        Args:
+            input_file: Uploaded input audio file.
+            reference_file: Optional uploaded reference audio file. If provided,
+                it is used only for this conversion and the previous reference
+                is restored afterwards.
+
+        Returns:
+            Response with converted WAV audio binary.
+
+        Raises:
+            HTTPException: If the upload is too large or the conversion fails.
+        """
+        self.logger.info("🎵 API: Convert uploaded file - %s", input_file.filename)
+        tmp_paths: list[str] = []
+        try:
+            input_tmp_path = self._save_upload_file(input_file, "input", tmp_paths)
+            ref_tmp_path = (
+                self._save_upload_file(reference_file, "reference", tmp_paths)
+                if reference_file is not None
+                else None
+            )
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                output_tmp_path = f.name
+            tmp_paths.append(output_tmp_path)
+
+            with self._offline_model_session():
+                if ref_tmp_path is None:
+                    self.model.convert_file(input_tmp_path, output_tmp_path)
+                else:
+                    previous_path = self.model.reference_wav_path
+                    previous_wav = self.model.reference_wav
+                    self._set_reference_audio(ref_tmp_path)
+                    try:
+                        self.model.convert_file(input_tmp_path, output_tmp_path)
+                    finally:
+                        # Restore the previous reference audio and clear caches
+                        self._apply_reference_audio(previous_path, previous_wav)
+
+            wav_bytes = Path(output_tmp_path).read_bytes()
+            self.logger.info("✅ API: Upload conversion completed (%d bytes)", len(wav_bytes))
+            return Response(content=wav_bytes, media_type="audio/wav")
+        except HTTPException:
+            raise
+        except Exception as e:
+            self.logger.error("❌ API: Upload conversion failed: %s", str(e))
+            self._raise_conversion_error(e)
+        finally:
+            for path in tmp_paths:
+                Path(path).unlink(missing_ok=True)
+
+    def _save_upload_file(self, upload: UploadFile, label: str, tmp_paths: list[str]) -> str:
+        """Read an uploaded file, validate its size, and write it to a temp file.
+
+        Args:
+            upload: The uploaded file.
+            label: Label used in error messages (e.g. "input", "reference").
+            tmp_paths: List to append the temp file path for cleanup.
+
+        Returns:
+            Path to the written temp file.
+
+        Raises:
+            HTTPException: If the uploaded file is too large.
+        """
+        # Stream to a temp file in chunks so oversized uploads are rejected
+        # without buffering the whole payload in memory
+        size = 0
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_path = f.name
+            tmp_paths.append(tmp_path)
+            while chunk := upload.file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD_SIZE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"{label.capitalize()} file too large "
+                            f"(max {MAX_UPLOAD_SIZE_BYTES // 1024 // 1024} MB)"
+                        ),
+                    )
+                f.write(chunk)
+        return tmp_path
 
     def change_conversion_mode(self, request: ConversionModeRequest) -> JSONResponse:
         """Change the conversion mode.
@@ -494,10 +777,7 @@ class APIRouterVCModel:
                     self.logger.info("🔄 API: Loading default model from HuggingFace")
 
                 # Clear cached prompt condition to force recalculation
-                self.model.prompt_condition = None
-                self.model.mel2 = None
-                self.model.style2 = None
-                self.model.reference_wav_name = ""
+                self._clear_reference_cache()
 
                 # Reload models in-place
                 self.logger.info("🔄 API: Reloading model components...")

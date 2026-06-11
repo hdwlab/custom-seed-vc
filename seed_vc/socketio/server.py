@@ -29,11 +29,14 @@ import yaml
 from fastapi import FastAPI
 from socketio.exceptions import ConnectionRefusedError as SocketIOConnectionRefused
 
+from seed_vc.socketio.runtime import ServerRuntimeCoordinator
 from seed_vc.socketio.schemas import (
+    OFFLINE_BUSY_MESSAGE,
     ChunkSizeMismatchError,
     ClientAudioConfig,
     ConnectionErrorType,
     MaxClientsReachedError,
+    OfflineBusyError,
 )
 
 # Create logger instance
@@ -68,6 +71,9 @@ fastapi_app = FastAPI(
 global_converter: Optional[VoiceConverter] = None
 converter_lock = threading.Lock()
 
+# Shared runtime state for realtime/offline exclusion
+runtime = ServerRuntimeCoordinator()
+
 # Store client-specific state
 client_converters: Dict[str, Optional[VoiceConverter]] = {}
 converter_init_status: Dict[str, bool] = {}  # Track if initialization was attempted
@@ -91,24 +97,6 @@ async def connect(
         bool: True if connection is accepted, False otherwise.
     """
     logger.info("🔗 Client connection attempt: %s", sid)
-
-    # Check if maximum number of clients is already connected
-    with converter_lock:
-        current_clients = len(client_converters)
-
-    if current_clients >= MAX_CLIENT:
-        logger.error(
-            "❌ Connection rejected for client %s: "
-            "Maximum number of clients (%d) already connected",
-            sid,
-            MAX_CLIENT,
-        )
-        # Use ConnectionRefusedError to send custom error message to client
-        error_message: MaxClientsReachedError = {
-            "error": ConnectionErrorType.MAX_CLIENTS_REACHED.value,
-            "message": f"Maximum number of clients ({MAX_CLIENT}) already connected",
-        }
-        raise SocketIOConnectionRefused(error_message)
 
     # Validate chunk size and sample rate if provided
     if auth:
@@ -157,6 +145,30 @@ async def connect(
     else:
         logger.warning("⚠️ Client %s connected without authentication data", sid)
 
+    # Register the client, rejecting it when the server is fully occupied
+    # or an offline conversion job is in progress
+    error = runtime.try_register_client(sid, MAX_CLIENT)
+    if error == ConnectionErrorType.MAX_CLIENTS_REACHED:
+        logger.error(
+            "❌ Connection rejected for client %s: "
+            "Maximum number of clients (%d) already connected",
+            sid,
+            MAX_CLIENT,
+        )
+        # Use ConnectionRefusedError to send custom error message to client
+        error_message: MaxClientsReachedError = {
+            "error": ConnectionErrorType.MAX_CLIENTS_REACHED.value,
+            "message": f"Maximum number of clients ({MAX_CLIENT}) already connected",
+        }
+        raise SocketIOConnectionRefused(error_message)
+    if error == ConnectionErrorType.OFFLINE_BUSY:
+        logger.error("❌ Connection rejected for client %s: offline conversion in progress", sid)
+        offline_error: OfflineBusyError = {
+            "error": ConnectionErrorType.OFFLINE_BUSY.value,
+            "message": OFFLINE_BUSY_MESSAGE,
+        }
+        raise SocketIOConnectionRefused(offline_error)
+
     # Assign the global converter to this client
     with converter_lock:
         client_converters[sid] = global_converter
@@ -178,6 +190,8 @@ async def disconnect(sid: str) -> None:
         sid: Client session ID.
     """
     logger.info("🔌 Client disconnected: %s", sid)
+
+    runtime.unregister_client(sid)
 
     # Clean up converter
     with converter_lock:
@@ -317,6 +331,12 @@ async def audio_chunk(sid: str, data: bytes) -> None:
         await sio.emit("audio_chunk", data, to=sid)
         return
 
+    # Drop chunks from unregistered clients so that stale in-flight chunks
+    # never wait on the model lock held by an offline conversion job
+    if not runtime.has_client(sid):
+        logger.warning("⚠️ Dropping audio chunk for unregistered client: %s", sid)
+        return
+
     # Start timing for RTF calculation
     start_time = time.time()
 
@@ -329,12 +349,17 @@ async def audio_chunk(sid: str, data: bytes) -> None:
         frames = len(audio_array)
         outdata = np.zeros_like(audio_2d)  # Must match input shape
 
-        # Clear previous output
-        converter.output_wav = []
+        with runtime.model_lock:
+            if not runtime.has_client(sid):
+                logger.warning("⚠️ Dropping audio chunk for disconnected client: %s", sid)
+                return
 
-        converter.audio_callback(
-            indata=audio_2d, outdata=outdata, frames=frames, time=None, status=None
-        )
+            # Clear previous output
+            converter.output_wav = []
+
+            converter.audio_callback(
+                indata=audio_2d, outdata=outdata, frames=frames, time=None, status=None
+            )
 
         # Get converted audio from outdata
         converted_audio = outdata[:, 0]  # Remove channel dimension
@@ -417,17 +442,14 @@ def main() -> None:
         logger.error("❌ Failed to initialize VoiceConverter. Exiting...")
         return
 
-    # Create client count checker function that captures the actual client_converters
-    def get_client_count() -> int:
-        with converter_lock:
-            return len(client_converters)
-
-    # API router for VoiceConverter model
+    # API router for VoiceConverter model, sharing the runtime state used by
+    # the Socket.IO handlers so that realtime clients and offline conversion
+    # jobs exclude each other
     api_router = APIRouterVCModel(
         model=global_converter,
         log_level=args.log_level,
         allowed_audio_dirs=args.allowed_audio_dirs,
-        client_count_checker=get_client_count,
+        runtime=runtime,
     )
 
     # Add the VoiceConverter API routes to FastAPI

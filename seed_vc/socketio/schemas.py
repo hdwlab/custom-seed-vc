@@ -27,6 +27,10 @@ class ConnectionErrorType(Enum):
 
     CHUNK_SIZE_MISMATCH = "chunk_size_mismatch"
     MAX_CLIENTS_REACHED = "max_clients_reached"
+    OFFLINE_BUSY = "offline_busy"
+
+
+OFFLINE_BUSY_MESSAGE = "Offline conversion is already in progress. Please try again later."
 
 
 class ChunkSizeMismatchError(TypedDict):
@@ -46,6 +50,13 @@ class MaxClientsReachedError(TypedDict):
     message: str
 
 
+class OfflineBusyError(TypedDict):
+    """Error details for an offline conversion job in progress."""
+
+    error: str  # Should be ConnectionErrorType.OFFLINE_BUSY.value
+    message: str
+
+
 class ClientAudioConfig(TypedDict):
     """Audio configuration sent from client to server during connection."""
 
@@ -54,7 +65,7 @@ class ClientAudioConfig(TypedDict):
 
 
 # Union type for all connection error types
-ConnectionError = Union[ChunkSizeMismatchError, MaxClientsReachedError]
+ConnectionError = Union[ChunkSizeMismatchError, MaxClientsReachedError, OfflineBusyError]
 
 
 # API Request Models
@@ -67,6 +78,21 @@ class ReferenceAudioRequest(BaseModel):
         ...,
         description="Path to the reference audio file. Must be within allowed directories.",
         example="assets/examples/reference/sample.wav",
+    )
+
+
+class FileConversionRequest(BaseModel):
+    """Request model for file-path-based voice conversion."""
+
+    input_path: str = Field(
+        ...,
+        description="Path to the input audio file. Must be within allowed directories.",
+        example="assets/examples/reference/sample.wav",
+    )
+    output_path: str = Field(
+        ...,
+        description="Path to save the converted audio file. Must be within allowed directories.",
+        example="assets/examples/reference/converted.wav",
     )
 
 

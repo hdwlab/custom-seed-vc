@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from socketio.exceptions import ConnectionRefusedError as SocketIOConnectionRefused
 
+from seed_vc.socketio import server as server_module
+from seed_vc.socketio.runtime import ServerRuntimeCoordinator
 from seed_vc.socketio.schemas import ConnectionErrorType
 from seed_vc.socketio.server import (
     client_converters,
@@ -23,6 +25,7 @@ class TestServerConnectionLimits:
         # Clear any existing client state
         client_converters.clear()
         converter_init_status.clear()
+        server_module.runtime = ServerRuntimeCoordinator()
 
     def test_single_client_connection_allowed(self):
         """Test that a single client can connect successfully."""
@@ -213,6 +216,49 @@ class TestServerConnectionLimits:
                 assert result2 is True
                 assert result3 is True
                 assert len(client_converters) == 3
+
+
+class TestOfflineJobConnectionExclusion:
+    """Test cases for connection exclusion during offline conversion jobs."""
+
+    def setup_method(self):
+        """Setup server state before each test."""
+        client_converters.clear()
+        converter_init_status.clear()
+        server_module.runtime = ServerRuntimeCoordinator()
+
+    def test_connection_rejected_while_offline_job_active(self):
+        """Test that a client is rejected while an offline conversion job is active."""
+        with patch("seed_vc.socketio.server.MAX_CLIENT", 1):
+            with patch("seed_vc.socketio.server.global_converter", MagicMock()):
+                assert server_module.runtime.try_begin_offline_job()
+
+                with pytest.raises(SocketIOConnectionRefused) as exc_info:
+                    asyncio.run(connect("client1", {}, None))
+
+                error_data = exc_info.value.args[0]
+                assert error_data["error"] == ConnectionErrorType.OFFLINE_BUSY.value
+                assert "client1" not in client_converters
+
+    def test_connection_allowed_after_offline_job_finished(self):
+        """Test that a client can connect after the offline job finishes."""
+        with patch("seed_vc.socketio.server.MAX_CLIENT", 1):
+            with patch("seed_vc.socketio.server.global_converter", MagicMock()):
+                server_module.runtime.try_begin_offline_job()
+                server_module.runtime.finish_offline_job()
+
+                result = asyncio.run(connect("client1", {}, None))
+
+                assert result is True
+                assert "client1" in client_converters
+
+    def test_offline_job_rejected_while_client_connected(self):
+        """Test that an offline job cannot start while a client is connected."""
+        with patch("seed_vc.socketio.server.MAX_CLIENT", 1):
+            with patch("seed_vc.socketio.server.global_converter", MagicMock()):
+                asyncio.run(connect("client1", {}, None))
+
+                assert server_module.runtime.try_begin_offline_job() is False
 
 
 class TestLoadConverterConfig:

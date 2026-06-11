@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import librosa
 import numpy as np
 import sounddevice as sd
+import soundfile as sf
 import torch
 import torch.nn.functional as F
 import torchaudio
@@ -981,3 +982,60 @@ class VoiceConverter:
             processing_time_sec,
             audio_duration_sec,
         )
+
+    def convert_file(self, input_path: str, output_path: str) -> dict:
+        """Convert an entire audio file offline by streaming it block by block.
+
+        Args:
+            input_path: Path to the input audio file.
+            output_path: Path to save the converted audio file.
+
+        Returns:
+            Dict with conversion metadata.
+
+        Raises:
+            ValueError: If the input audio file is empty.
+            RuntimeError: If the reference audio is not set.
+        """
+        if self.reference_wav is None:
+            raise RuntimeError("Reference audio not set. Call update_reference_audio() first.")
+
+        input_wav, _ = librosa.load(input_path, sr=self.input_sampling_rate)
+        n_input_samples = len(input_wav)
+        if n_input_samples == 0:
+            raise ValueError(f"Input audio file is empty: {input_path}")
+        input_duration = n_input_samples / self.input_sampling_rate
+
+        # Reset streaming buffers so the conversion starts from a clean state
+        self._init_buffers()
+        self.output_wav = []
+
+        # Pad to a multiple of block_frame and process through the streaming pipeline,
+        # collecting the converted blocks appended to self.output_wav by audio_callback
+        remainder = n_input_samples % self.block_frame
+        if remainder != 0:
+            input_wav = np.pad(input_wav, (0, self.block_frame - remainder))
+
+        for start in range(0, len(input_wav), self.block_frame):
+            block = input_wav[start : start + self.block_frame].reshape(-1, self.channels)
+            self.audio_callback(
+                indata=block, outdata=None, frames=self.block_frame, time=None, status=None
+            )
+
+        output_wav = np.concatenate(self.output_wav)[:n_input_samples, 0]
+        output_duration = len(output_wav) / self.input_sampling_rate
+
+        sf.write(output_path, output_wav, self.input_sampling_rate)
+
+        # Reset buffers again so realtime streaming starts from a clean state
+        self._init_buffers()
+        self.output_wav = []
+
+        return {
+            "message": "File conversion completed successfully",
+            "input_path": input_path,
+            "output_path": output_path,
+            "input_duration": input_duration,
+            "output_duration": output_duration,
+            "sampling_rate": self.input_sampling_rate,
+        }

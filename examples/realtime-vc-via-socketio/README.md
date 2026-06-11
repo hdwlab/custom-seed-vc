@@ -110,6 +110,20 @@ $ curl -X POST "http://localhost:5000/api/v1/reload" \
     -d '{"checkpoint_path": "examples/fine-tuning/runs/my_run/ft_model.pth", "config_path": "examples/fine-tuning/runs/my_run/config_dit_mel_seed_uvit_xlsr_tiny.yml"}'
 ```
 
+- オフラインのファイル変換（Clientが接続していない状態でのみ実行可能）
+```bash
+# Server上のファイルパスを指定して変換
+$ curl -X POST "http://localhost:5000/api/v1/convert" \
+    -H "Content-Type: application/json" \
+    -d '{"input_path": "assets/examples/reference/trump_0.wav", "output_path": "assets/examples/reference/converted.wav"}'
+
+# ファイルをアップロードして変換結果をダウンロード (リファレンス音声の一時指定も可能)
+$ curl -X POST "http://localhost:5000/api/v1/convert/upload" \
+    -F "input_file=@/path/to/input.wav" \
+    -F "reference_file=@/path/to/reference.wav" \
+    -o converted.wav
+```
+
 詳しいAPIの仕様は、Serverを起動した状態で、ブラウザから`http://localhost:5000/docs`にアクセスすることで確認できます。
 
 ## Dockerを用いた実行
