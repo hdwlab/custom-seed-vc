@@ -16,10 +16,12 @@
 
 """Type definitions for Socket.IO communication and API requests."""
 
+from __future__ import annotations
+
 from enum import Enum
 from typing import Literal, Optional, TypedDict, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ConnectionErrorType(Enum):
@@ -63,6 +65,14 @@ class InvalidOperatorInfoError(TypedDict):
 
     error: str
     message: str
+
+
+class RealtimeConversionError(TypedDict):
+    """Error reported when a realtime chunk could not be converted."""
+
+    error: str
+    message: str
+    action: Literal["silence"]
 
 
 class ClientAudioConfig(TypedDict, total=False):
@@ -113,6 +123,59 @@ class FileConversionRequest(BaseModel):
         description="Path to save the converted audio file. Must be within allowed directories.",
         example="assets/examples/reference/converted.wav",
     )
+    operator_id: Optional[str] = Field(
+        default=None,
+        description="Operator ID used for deterministic preset and speaker vector selection.",
+    )
+    gender: Optional[Literal["male", "female"]] = Field(
+        default=None,
+        description="Optional preset gender filter. Requires operator_id.",
+    )
+    preset_id: Optional[str] = Field(
+        default=None,
+        description="Optional explicit voice preset. Requires operator_id and overrides gender.",
+    )
+
+    @model_validator(mode="after")
+    def validate_operator_voice(self) -> FileConversionRequest:
+        """Reject partial or empty operator voice requests."""
+        validate_operator_voice_fields(self.operator_id, self.gender, self.preset_id)
+        return self
+
+
+class BatchFileConversionRequest(BaseModel):
+    """One asynchronous job containing one or more file-path conversions."""
+
+    items: list[FileConversionRequest] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="File conversions processed sequentially by the shared model.",
+    )
+
+    @model_validator(mode="after")
+    def validate_unique_outputs(self) -> BatchFileConversionRequest:
+        """Reject ambiguous batches that overwrite one output more than once."""
+        outputs = [item.output_path for item in self.items]
+        if len(outputs) != len(set(outputs)):
+            raise ValueError("Batch output_path values must be unique")
+        return self
+
+
+def validate_operator_voice_fields(
+    operator_id: Optional[str],
+    gender: Optional[str],
+    preset_id: Optional[str],
+) -> None:
+    """Validate fields shared by JSON and multipart offline conversion requests."""
+    if operator_id is None:
+        if gender is not None or preset_id is not None:
+            raise ValueError("operator_id is required when gender or preset_id is given")
+        return
+    if not operator_id.strip():
+        raise ValueError("operator_id must be a non-empty string")
+    if gender is not None and gender not in {"male", "female"}:
+        raise ValueError("gender must be one of ('male', 'female') when given")
 
 
 class ConversionModeRequest(BaseModel):

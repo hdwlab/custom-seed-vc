@@ -23,23 +23,34 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import Callable, Iterator, NoReturn, Optional
+from typing import Annotated, Any, Callable, Iterator, NoReturn, Optional
 
 import librosa
-from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi import APIRouter, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from seed_vc.socketio.model import ConversionMode, VoiceConverter
+from seed_vc.socketio.offline_jobs import (
+    OfflineJobBusyError,
+    OfflineJobManager,
+    OfflineJobQueueFullError,
+)
 from seed_vc.socketio.runtime import ServerRuntimeCoordinator
 from seed_vc.socketio.schemas import (
     OFFLINE_BUSY_MESSAGE,
+    BatchFileConversionRequest,
     ConversionModeRequest,
     FileConversionRequest,
     ModelParametersRequest,
     ModelReloadRequest,
     ReferenceAudioRequest,
+    validate_operator_voice_fields,
 )
-from seed_vc.socketio.voice_presets import VoicePresetStore
+from seed_vc.socketio.voice_presets import (
+    VoicePresetStore,
+    apply_preset_voice,
+    validate_voice_store_compatibility,
+)
 
 logger = logging.getLogger(__name__)
 logger.propagate = False
@@ -173,6 +184,7 @@ class APIRouterVCModel:
             client_count_checker = runtime.client_count
         self.client_count_checker = client_count_checker
         self.voice_store = voice_store
+        self.offline_job_manager: Optional[OfflineJobManager] = None
 
         # Set allowed directories for audio files
         if allowed_audio_dirs is None:
@@ -184,6 +196,10 @@ class APIRouterVCModel:
     def model_lock(self) -> threading.Lock:
         """Lock guarding model access, shared with the Socket.IO handlers."""
         return self.runtime.model_lock
+
+    def attach_offline_job_manager(self, manager: OfflineJobManager) -> None:
+        """Attach the queue that owns asynchronous offline model reservations."""
+        self.offline_job_manager = manager
 
     def _init_routes(self) -> None:
         """Set up API routes. Can be overridden in subclasses."""
@@ -197,6 +213,11 @@ class APIRouterVCModel:
             "/presets",
             self.get_presets,
             methods=["GET"],
+        )
+        self.api_router.add_api_route(
+            "/presets/reload",
+            self.reload_voice_presets,
+            methods=["POST"],
         )
         self.api_router.add_api_route(
             "/reference",
@@ -227,6 +248,17 @@ class APIRouterVCModel:
             "/convert/upload",
             self.convert_file_upload,
             methods=["POST"],
+        )
+        self.api_router.add_api_route(
+            "/convert/jobs",
+            self.submit_conversion_job,
+            methods=["POST"],
+            status_code=202,
+        )
+        self.api_router.add_api_route(
+            "/convert/jobs/{job_id}",
+            self.get_conversion_job,
+            methods=["GET"],
         )
 
     def _is_in_allowed_dirs(self, resolved_path: Path) -> bool:
@@ -347,6 +379,40 @@ class APIRouterVCModel:
                 "presets": [
                     {"id": p.preset_id, "gender": p.gender} for p in self.voice_store.list_presets()
                 ],
+                "has_vector_space": self.voice_store.has_vector_space,
+                "schema_version": self.voice_store.schema_version,
+                "bundle_id": self.voice_store.bundle_id,
+            },
+            status_code=200,
+        )
+
+    def reload_voice_presets(self) -> JSONResponse:
+        """Reload and validate the configured preset bundle without restarting."""
+        if self.voice_store is None:
+            raise HTTPException(status_code=404, detail="Voice presets are not configured")
+
+        previous_bundle_id = self.voice_store.bundle_id
+        try:
+            with self._offline_model_session():
+                self.voice_store.reload(
+                    lambda candidate: validate_voice_store_compatibility(self.model, candidate)
+                )
+        except HTTPException:
+            raise
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to reload voice presets: {error}",
+            ) from error
+        return JSONResponse(
+            content={
+                "message": "Voice presets reloaded successfully",
+                "previous_bundle_id": previous_bundle_id,
+                "bundle_id": self.voice_store.bundle_id,
+                "schema_version": self.voice_store.schema_version,
+                "preset_count": len(self.voice_store.list_presets()),
                 "has_vector_space": self.voice_store.has_vector_space,
             },
             status_code=200,
@@ -535,7 +601,16 @@ class APIRouterVCModel:
 
         try:
             with self._offline_model_session():
-                result = self.model.convert_file(validated_input, validated_output)
+                with self._temporary_voice(
+                    operator_id=request.operator_id,
+                    gender=request.gender,
+                    preset_id=request.preset_id,
+                ) as selected_preset_id:
+                    result = self.model.convert_file(validated_input, validated_output)
+            if selected_preset_id is not None:
+                result["preset_id"] = selected_preset_id
+                if self.voice_store is not None and self.voice_store.bundle_id is not None:
+                    result["preset_bundle_id"] = self.voice_store.bundle_id
             self.logger.info("✅ API: File conversion completed - %s", validated_output)
             return JSONResponse(content=result, status_code=200)
         except HTTPException:
@@ -544,10 +619,103 @@ class APIRouterVCModel:
             self.logger.error("❌ API: File conversion failed: %s", str(e))
             self._raise_conversion_error(e)
 
+    def submit_conversion_job(self, request: BatchFileConversionRequest) -> JSONResponse:
+        """Validate and queue a sequential file-path conversion batch."""
+        if self.offline_job_manager is None:
+            raise HTTPException(status_code=503, detail="Offline job queue is not configured")
+        connected_count = (
+            self.client_count_checker() if self.client_count_checker is not None else 0
+        )
+        if connected_count > 0:
+            raise _connected_clients_http_exception(connected_count)
+        validated_items = [
+            (
+                item,
+                self._validate_file_path(item.input_path),
+                self._validate_output_path(item.output_path),
+            )
+            for item in request.items
+        ]
+        resolved_outputs = [output_path for _, _, output_path in validated_items]
+        if len(resolved_outputs) != len(set(resolved_outputs)):
+            raise HTTPException(status_code=400, detail="Batch output_path values must be unique")
+        if any(item.operator_id is not None for item, _, _ in validated_items):
+            if self.voice_store is None:
+                raise HTTPException(status_code=400, detail="Voice presets are not configured")
+        try:
+            job_id = self.offline_job_manager.submit(
+                lambda: self._run_conversion_batch(validated_items)
+            )
+        except OfflineJobBusyError:
+            self._raise_offline_exclusion_error()
+        except OfflineJobQueueFullError as error:
+            raise HTTPException(status_code=429, detail=str(error)) from error
+        return JSONResponse(
+            content={
+                "id": job_id,
+                "status": "queued",
+                "item_count": len(validated_items),
+                "status_url": f"/api/v1/convert/jobs/{job_id}",
+            },
+            status_code=202,
+        )
+
+    def get_conversion_job(self, job_id: str) -> JSONResponse:
+        """Return the current state and eventual result of an offline job."""
+        if self.offline_job_manager is None:
+            raise HTTPException(status_code=503, detail="Offline job queue is not configured")
+        job = self.offline_job_manager.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Offline job not found: {job_id}")
+        return JSONResponse(content=job, status_code=200)
+
+    def _run_conversion_batch(
+        self,
+        items: list[tuple[FileConversionRequest, str, str]],
+    ) -> dict[str, Any]:
+        """Run validated batch items while OfflineJobManager owns the model."""
+        results = []
+        for index, (item, input_path, output_path) in enumerate(items):
+            self.model._init_buffers()
+            try:
+                with self._temporary_voice(
+                    operator_id=item.operator_id,
+                    gender=item.gender,
+                    preset_id=item.preset_id,
+                ) as selected_preset_id:
+                    result = self.model.convert_file(input_path, output_path)
+                result = dict(result)
+                result.update({"index": index, "status": "succeeded"})
+                if selected_preset_id is not None:
+                    result["preset_id"] = selected_preset_id
+                    if self.voice_store is not None and self.voice_store.bundle_id is not None:
+                        result["preset_bundle_id"] = self.voice_store.bundle_id
+                results.append(result)
+            except Exception as error:
+                results.append(
+                    {
+                        "index": index,
+                        "status": "failed",
+                        "input_path": input_path,
+                        "output_path": output_path,
+                        "error": str(error),
+                    }
+                )
+        succeeded = sum(result["status"] == "succeeded" for result in results)
+        return {
+            "item_count": len(results),
+            "succeeded": succeeded,
+            "failed": len(results) - succeeded,
+            "items": results,
+        }
+
     def convert_file_upload(
         self,
         input_file: UploadFile,
         reference_file: Optional[UploadFile] = None,
+        operator_id: Annotated[Optional[str], Form()] = None,
+        gender: Annotated[Optional[str], Form()] = None,
+        preset_id: Annotated[Optional[str], Form()] = None,
     ) -> Response:
         """Convert an uploaded audio file and return the converted WAV binary.
 
@@ -556,6 +724,9 @@ class APIRouterVCModel:
             reference_file: Optional uploaded reference audio file. If provided,
                 it is used only for this conversion and the previous reference
                 is restored afterwards.
+            operator_id: Optional operator ID for deterministic voice selection.
+            gender: Optional preset gender filter.
+            preset_id: Optional explicit preset ID.
 
         Returns:
             Response with converted WAV audio binary.
@@ -566,6 +737,12 @@ class APIRouterVCModel:
         self.logger.info("🎵 API: Convert uploaded file - %s", input_file.filename)
         tmp_paths: list[str] = []
         try:
+            validate_operator_voice_fields(operator_id, gender, preset_id)
+            if reference_file is not None and operator_id is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="reference_file and operator_id cannot be used together",
+                )
             input_tmp_path = self._save_upload_file(input_file, "input", tmp_paths)
             ref_tmp_path = (
                 self._save_upload_file(reference_file, "reference", tmp_paths)
@@ -577,21 +754,25 @@ class APIRouterVCModel:
             tmp_paths.append(output_tmp_path)
 
             with self._offline_model_session():
-                if ref_tmp_path is None:
+                with self._temporary_voice(
+                    reference_path=ref_tmp_path,
+                    operator_id=operator_id,
+                    gender=gender,
+                    preset_id=preset_id,
+                ) as selected_preset_id:
                     self.model.convert_file(input_tmp_path, output_tmp_path)
-                else:
-                    previous_path = self.model.reference_wav_path
-                    previous_wav = self.model.reference_wav
-                    self._set_reference_audio(ref_tmp_path)
-                    try:
-                        self.model.convert_file(input_tmp_path, output_tmp_path)
-                    finally:
-                        # Restore the previous reference audio and clear caches
-                        self._apply_reference_audio(previous_path, previous_wav)
 
             wav_bytes = Path(output_tmp_path).read_bytes()
             self.logger.info("✅ API: Upload conversion completed (%d bytes)", len(wav_bytes))
-            return Response(content=wav_bytes, media_type="audio/wav")
+            headers = (
+                {"X-Voice-Preset-ID": selected_preset_id}
+                if selected_preset_id is not None
+                else None
+            )
+            if headers is not None and self.voice_store is not None:
+                if self.voice_store.bundle_id is not None:
+                    headers["X-Voice-Preset-Bundle-ID"] = self.voice_store.bundle_id
+            return Response(content=wav_bytes, media_type="audio/wav", headers=headers)
         except HTTPException:
             raise
         except Exception as e:
@@ -633,6 +814,42 @@ class APIRouterVCModel:
                     )
                 f.write(chunk)
         return tmp_path
+
+    @contextmanager
+    def _temporary_voice(
+        self,
+        reference_path: Optional[str] = None,
+        operator_id: Optional[str] = None,
+        gender: Optional[str] = None,
+        preset_id: Optional[str] = None,
+    ) -> Iterator[Optional[str]]:
+        """Temporarily apply an uploaded reference or operator-specific voice.
+
+        Must be entered within ``_offline_model_session`` while the model lock is held.
+
+        Yields:
+            The selected preset ID when operator voice selection is active.
+        """
+        if reference_path is None and operator_id is None:
+            yield None
+            return
+        previous_path = self.model.reference_wav_path
+        previous_wav = self.model.reference_wav
+        try:
+            selected_preset_id = None
+            if reference_path is not None:
+                self._set_reference_audio(reference_path)
+            else:
+                if self.voice_store is None:
+                    raise ValueError("Voice presets are not configured on this server")
+                if operator_id is None:
+                    raise ValueError("operator_id is required for preset voice selection")
+                preset = self.voice_store.resolve_preset(operator_id, gender, preset_id)
+                apply_preset_voice(self.model, self.voice_store, preset, operator_id)
+                selected_preset_id = preset.preset_id
+            yield selected_preset_id
+        finally:
+            self._apply_reference_audio(previous_path, previous_wav)
 
     def change_conversion_mode(self, request: ConversionModeRequest) -> JSONResponse:
         """Change the conversion mode.

@@ -20,7 +20,7 @@ import argparse
 import logging
 import queue
 import threading
-from typing import Any, Dict, Union
+from typing import Any, Dict, Optional, Union
 
 import numpy as np
 import socketio
@@ -29,6 +29,7 @@ import sounddevice as sd
 from seed_vc.socketio.schemas import (
     ClientAudioConfig,
     ConnectionErrorType,
+    RealtimeConversionError,
 )
 from seed_vc.socketio.schemas import (
     ConnectionError as SocketIOConnectionError,
@@ -51,6 +52,7 @@ CHANNELS = 1
 DTYPE = "int16"
 CHUNK_SIZE = 7938  # Number of frames
 MAX_QUEUE_SIZE = 1  # Maximum queued chunks before draining stale audio
+AudioDevice = Union[int, str]
 
 # Global queues and client
 play_q: queue.Queue[bytes] = queue.Queue()  # Server -> Speaker
@@ -93,6 +95,23 @@ def on_connection_error(data: SocketIOConnectionError) -> None:
     """
     global connection_error_details
     connection_error_details = data
+
+
+@sio.on("conversion_error")
+def on_conversion_error(data: RealtimeConversionError) -> None:
+    """Report a realtime conversion failure from the server.
+
+    The matching audio chunk contains silence so the original microphone
+    signal is never played back as a fallback.
+
+    Args:
+        data: Structured conversion error details from the server.
+    """
+    logger.error(
+        "Realtime conversion failed: %s (action=%s)",
+        data.get("message", "unknown error"),
+        data.get("action", "unknown"),
+    )
 
 
 @sio.on("connect_error")
@@ -144,6 +163,45 @@ def send_loop() -> None:
                 logger.error("❌ Send error: %s", e)
 
 
+def parse_audio_device(value: str) -> AudioDevice:
+    """Parse a sounddevice index or a device name from a CLI value."""
+    value = value.strip()
+    if not value:
+        raise argparse.ArgumentTypeError("audio device must not be empty")
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+def validate_audio_devices(
+    input_device: Optional[AudioDevice],
+    output_device: Optional[AudioDevice],
+    sample_rate: int,
+) -> None:
+    """Validate explicitly selected audio devices before connecting.
+
+    Args:
+        input_device: Input device index or name, or None for the OS default.
+        output_device: Output device index or name, or None for the OS default.
+        sample_rate: Server-compatible stream sampling rate.
+    """
+    if input_device is not None:
+        sd.check_input_settings(
+            device=input_device,
+            channels=CHANNELS,
+            dtype=DTYPE,
+            samplerate=sample_rate,
+        )
+    if output_device is not None:
+        sd.check_output_settings(
+            device=output_device,
+            channels=CHANNELS,
+            dtype=DTYPE,
+            samplerate=sample_rate,
+        )
+
+
 def main() -> None:
     """Start the audio streaming client."""
     parser = argparse.ArgumentParser(description="Real-time audio streaming client")
@@ -168,6 +226,23 @@ def main() -> None:
         help="Server port number",
     )
     parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="List audio devices and exit",
+    )
+    parser.add_argument(
+        "--input-device",
+        type=parse_audio_device,
+        default=None,
+        help="Input device index or name (default: OS default)",
+    )
+    parser.add_argument(
+        "--output-device",
+        type=parse_audio_device,
+        default=None,
+        help="Output device index or name (default: OS default)",
+    )
+    parser.add_argument(
         "--operator-id",
         default=None,
         help="Operator ID used for deterministic voice preset assignment",
@@ -190,6 +265,9 @@ def main() -> None:
         help="Set the logging level (default: INFO)",
     )
     args = parser.parse_args()
+    if args.list_devices:
+        print(sd.query_devices())
+        return
 
     # Update log level if specified via command line
     numeric_level = getattr(logging, args.log_level.upper(), None)
@@ -199,6 +277,12 @@ def main() -> None:
 
     url = f"http://{args.host}:{args.port}"
     logger.info("🔗 Connecting to %s", url)
+
+    try:
+        validate_audio_devices(args.input_device, args.output_device, SAMPLE_RATE)
+    except Exception as e:
+        logger.error("Invalid audio device configuration: %s", e)
+        return
 
     # Send chunk size and sample rate for validation
     auth_data: ClientAudioConfig = {"chunk_size": args.chunk_size, "sample_rate": SAMPLE_RATE}
@@ -267,6 +351,7 @@ def main() -> None:
 
     # Input stream (microphone)
     with sd.RawInputStream(
+        device=args.input_device,
         samplerate=SAMPLE_RATE,
         blocksize=args.chunk_size,
         dtype=DTYPE,
@@ -275,7 +360,11 @@ def main() -> None:
     ):
         # Output stream (speaker)
         with sd.RawOutputStream(
-            samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE, dtype=DTYPE, channels=CHANNELS
+            device=args.output_device,
+            samplerate=SAMPLE_RATE,
+            blocksize=CHUNK_SIZE,
+            dtype=DTYPE,
+            channels=CHANNELS,
         ) as outstream:
             logger.info("🎧 Streaming... (Ctrl+C to stop)")
             try:

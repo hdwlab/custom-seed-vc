@@ -101,6 +101,8 @@ class TestPresetsEndpoint:
         """GET /presets returns preset IDs, genders, and vector-space status."""
         store = SimpleNamespace(
             has_vector_space=True,
+            schema_version=1,
+            bundle_id="bundle-123",
             list_presets=lambda: [
                 SimpleNamespace(preset_id="p1", gender="female"),
                 SimpleNamespace(preset_id="p2", gender=None),
@@ -117,6 +119,8 @@ class TestPresetsEndpoint:
         assert response.json() == {
             "presets": [{"id": "p1", "gender": "female"}, {"id": "p2", "gender": None}],
             "has_vector_space": True,
+            "schema_version": 1,
+            "bundle_id": "bundle-123",
         }
 
 

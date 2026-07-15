@@ -74,7 +74,30 @@ $ uv run python seed_vc/socketio/client.py
 
 この状態で、Client側のマイクから音声を入力すると、Server側で音声変換が行われ、変換された音声がClient側のスピーカーから再生されます。
 
+Clientは起動時点のOS / `sounddevice` のデフォルト入力デバイスとデフォルト出力デバイスを使用します。
+利用可能なdeviceは `--list-devices` で確認できます。
+マイクとスピーカーはdevice indexまたは名前で指定できます。
+
+```bash
+$ uv run python seed_vc/socketio/client.py --list-devices
+$ uv run python seed_vc/socketio/client.py \
+    --input-device 3 \
+    --output-device "USB Headset"
+```
+
+指定したdeviceが44100 Hz、mono、int16形式に対応していない場合は、接続前にerrorを表示して終了します。
+
 ServerとClient間にラグがあると感じる場合は一度、Client側だけを再起動することで改善される場合があります。
+
+リアルタイム変換中にServer側でエラーが発生した場合は、原音をそのまま返さず、該当チャンクを無音に置き換えます。
+Clientには `conversion_error` イベントが通知され、エラー内容がログに表示されます。
+原音を出力する場合は、障害時のfallbackではなく `passthrough` modeを明示的に設定してください。
+
+Serverの監視には次のendpointを利用できます。
+
+- `GET /health/live`: ASGI processの死活確認
+- `GET /health/ready`: engine初期化状態、動作mode、接続数の確認
+- `GET /metrics`: 接続数、変換error数、破棄chunk数、処理時間、RTFのPrometheus形式metrics
 
 ### FastAPIによる設定の変更
 
@@ -139,6 +162,58 @@ $ curl -X POST "http://localhost:5000/api/v1/convert/upload" \
     -F "input_file=@/path/to/input.wav" \
     -F "reference_file=@/path/to/reference.wav" \
     -o converted.wav
+```
+
+複数のServer側ファイルを変換完了を待たずに投入する場合は、非同期ジョブAPIを使用できます。
+1ジョブは1件から100件までで、単一workerが投入順に処理します。
+
+```bash
+$ curl -X POST "http://localhost:5000/api/v1/convert/jobs" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "items": [
+        {"input_path":"assets/examples/reference/trump_0.wav","output_path":"assets/examples/reference/output-1.wav"},
+        {"input_path":"assets/examples/reference/trump_0.wav","output_path":"assets/examples/reference/output-2.wav"}
+      ]
+    }'
+
+$ curl "http://localhost:5000/api/v1/convert/jobs/<job-id>"
+```
+
+ジョブの状態は `queued`、`running`、`succeeded`、`failed` のいずれかです。
+一部itemが失敗しても後続itemは処理され、結果は `result.items` に記録されます。
+先頭ジョブの受理からキューが空になるまではリアルタイム変換と同期オフライン変換を受け付けません。
+ジョブ情報はメモリ上に直近100件まで保持され、Server再起動時に失われます。
+未完了ジョブが100件に達した場合はHTTP 429で拒否されます。
+
+Serverを `--presets-dir` 付きで起動すると、リアルタイム変換と同じ決定規則でoperatorごとのvoiceを選択できます。
+変換中だけ選択したpresetとspeaker vectorが適用され、変換後は元のreference音声に戻ります。
+
+```bash
+# Server側のfile pathを使う場合
+$ curl -X POST "http://localhost:5000/api/v1/convert" \
+    -H "Content-Type: application/json" \
+    -d '{"input_path":"assets/examples/reference/trump_0.wav","output_path":"assets/examples/reference/output.wav","operator_id":"alice","gender":"female"}'
+
+# uploadする場合
+$ curl -X POST "http://localhost:5000/api/v1/convert/upload" \
+    -F "input_file=@/path/to/input.wav" \
+    -F "operator_id=alice" \
+    -F "preset_id=female_001" \
+    -o converted.wav
+```
+
+`operator_id`だけを指定した場合は全presetが候補になります。
+`gender`または`preset_id`を使う場合は `operator_id`も必要です。
+upload APIでは `reference_file`と`operator_id`を同時に指定できません。
+選択されたpreset IDはpath指定APIのJSONでは `preset_id`、upload APIでは `X-Voice-Preset-ID` response headerに入ります。
+versioned preset bundleではbundle IDも `preset_bundle_id` または `X-Voice-Preset-Bundle-ID` に入ります。
+
+Server起動後にbundleを更新した場合は、Clientとoffline変換が動いていない状態で検証付きreloadを実行できます。
+新しいbundleの読み込みやSeed-VC互換性検証に失敗した場合は、現在のbundleがそのまま維持されます。
+
+```bash
+$ curl -X POST "http://localhost:5000/api/v1/presets/reload"
 ```
 
 詳しいAPIの仕様は、Serverを起動した状態で、ブラウザから`http://localhost:5000/docs`にアクセスすることで確認できます。

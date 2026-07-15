@@ -20,7 +20,7 @@ import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import yaml
@@ -31,6 +31,7 @@ _VALID_GENDERS = ("male", "female")
 _DEFAULT_SAMPLING_K = 8
 _DEFAULT_SAMPLING_EPS = 0.2
 _ENGINE_NAME = "seed-vc"
+_SUPPORTED_SCHEMA_VERSIONS = {0, 1}
 
 
 class VoicePresetError(ValueError):
@@ -49,6 +50,15 @@ class VoicePreset:
 def vector_space_path(presets_dir: str | Path, engine_name: str = _ENGINE_NAME) -> Path:
     """Return the conventional vector space path for an engine."""
     return Path(presets_dir) / "spaces" / f"{engine_name.replace('-', '_')}.npz"
+
+
+def sha256_file(path: str | Path) -> str:
+    """Return the hexadecimal SHA-256 digest of a file."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def apply_preset_voice(
@@ -71,17 +81,50 @@ def apply_preset_voice(
             logger.warning("Engine does not support speaker vectors; using reference audio only")
 
 
+def validate_voice_store_compatibility(engine, store: "VoicePresetStore") -> None:
+    """Fail clearly when a speaker vector space does not match Seed-VC."""
+    if not store.has_vector_space:
+        return
+    try:
+        anchor_dim = len(engine.get_speaker_vector())
+    except NotImplementedError:
+        logger.warning("Engine does not support speaker vectors; using reference audio only")
+        return
+    except RuntimeError:
+        # A model without a reference cannot expose its style dimension yet.
+        return
+    if anchor_dim != store.vector_dim:
+        raise ValueError(
+            f"Vector space dimension {store.vector_dim} does not match the "
+            f"engine speaker vector dimension {anchor_dim}; rebuild the space "
+            "with the same engine configuration as the server"
+        )
+
+
 class VoicePresetStore:
     """Load voice presets and resolve operator-specific voices."""
 
     def __init__(self, presets_dir: str, engine_name: str = _ENGINE_NAME) -> None:
         """Load and validate a presets directory."""
         self._presets_dir = Path(presets_dir)
+        self._engine_name = engine_name
         manifest_path = self._presets_dir / "presets.yaml"
         if not manifest_path.is_file():
             raise VoicePresetError(f"Manifest not found: {manifest_path} (presets.yaml)")
         with open(manifest_path) as f:
             manifest = yaml.safe_load(f) or {}
+
+        try:
+            self._schema_version = int(manifest.get("schema_version", 0))
+        except (TypeError, ValueError) as exc:
+            raise VoicePresetError("schema_version must be an integer") from exc
+        if self._schema_version not in _SUPPORTED_SCHEMA_VERSIONS:
+            raise VoicePresetError(
+                f"Unsupported preset schema_version: {self._schema_version} "
+                f"(supported: {sorted(_SUPPORTED_SCHEMA_VERSIONS)})"
+            )
+        provenance = manifest.get("provenance") or {}
+        self._bundle_id = str(provenance.get("bundle_id", "")) or None
 
         sampling = manifest.get("sampling") or {}
         try:
@@ -101,6 +144,28 @@ class VoicePresetStore:
             if self._vectors is not None
             else np.zeros(0, dtype=np.float32)
         )
+
+    def reload(self, validator: Optional[Callable[["VoicePresetStore"], None]] = None) -> None:
+        """Atomically replace this store with a newly validated disk snapshot.
+
+        The object identity is preserved because Socket.IO handlers and REST
+        routes share this instance. Any loading or validation error leaves the
+        current snapshot untouched.
+
+        Args:
+            validator: Optional compatibility check run against the candidate
+                snapshot before it becomes visible.
+        """
+        candidate = type(self)(str(self._presets_dir), self._engine_name)
+        if validator is not None:
+            validator(candidate)
+        self._schema_version = candidate._schema_version
+        self._bundle_id = candidate._bundle_id
+        self._k = candidate._k
+        self._eps = candidate._eps
+        self._presets = candidate._presets
+        self._vectors = candidate._vectors
+        self._vector_norms = candidate._vector_norms
 
     def _load_presets(self, manifest: dict) -> list[VoicePreset]:
         entries = manifest.get("presets") or []
@@ -127,6 +192,11 @@ class VoicePresetStore:
                 ) from None
             if not audio_path.is_file():
                 raise VoicePresetError(f"Audio file for preset {preset_id} not found: {audio_path}")
+            expected_sha256 = str(entry.get("sha256", ""))
+            if expected_sha256 and sha256_file(audio_path) != expected_sha256:
+                raise VoicePresetError(
+                    f"Audio checksum mismatch for preset {preset_id}: {audio_path}"
+                )
             presets.append(
                 VoicePreset(preset_id=preset_id, gender=gender, audio_path=str(audio_path))
             )
@@ -148,6 +218,16 @@ class VoicePresetStore:
     def has_vector_space(self) -> bool:
         """Whether a SeedVC vector space is loaded."""
         return self._vectors is not None
+
+    @property
+    def schema_version(self) -> int:
+        """Preset manifest schema version, where zero means a legacy manifest."""
+        return self._schema_version
+
+    @property
+    def bundle_id(self) -> Optional[str]:
+        """Content-derived preset bundle identifier, if recorded."""
+        return self._bundle_id
 
     @property
     def vector_dim(self) -> Optional[int]:

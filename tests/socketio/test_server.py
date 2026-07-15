@@ -3,6 +3,7 @@
 import asyncio
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 from socketio.exceptions import ConnectionRefusedError as SocketIOConnectionRefused
 
@@ -10,6 +11,7 @@ from seed_vc.socketio import server as server_module
 from seed_vc.socketio.runtime import ServerRuntimeCoordinator
 from seed_vc.socketio.schemas import ConnectionErrorType
 from seed_vc.socketio.server import (
+    audio_chunk,
     client_converters,
     connect,
     converter_init_status,
@@ -262,6 +264,81 @@ class TestOfflineJobConnectionExclusion:
                 asyncio.run(connect("client1", {}, None))
 
                 assert server_module.runtime.try_begin_offline_job() is False
+
+
+class TestRealtimeConversionFailures:
+    """Test fail-closed behavior for realtime conversion errors."""
+
+    def setup_method(self):
+        """Reset runtime state before each test."""
+        server_module.runtime = ServerRuntimeCoordinator()
+        assert server_module.runtime.try_register_client("client1", 1) is None
+
+    @staticmethod
+    def _mock_sio(emitted):
+        mock_sio = MagicMock()
+
+        async def emit(event, data, to):
+            emitted.append((event, data, to))
+
+        mock_sio.emit = emit
+        return mock_sio
+
+    def test_conversion_failure_emits_silence_and_error(self):
+        """Model errors must never return the original speaker's audio."""
+        converter = MagicMock()
+        converter.block_frame = 4
+        converter.input_sampling_rate = 44100
+        converter.audio_callback.side_effect = RuntimeError("conversion failed")
+        original = np.full(4, 1234, dtype=np.int16).tobytes()
+        emitted = []
+
+        with (
+            patch("seed_vc.socketio.server.global_converter", converter),
+            patch("seed_vc.socketio.server.sio", self._mock_sio(emitted)),
+        ):
+            asyncio.run(audio_chunk("client1", original))
+
+        assert [event for event, _, _ in emitted] == ["conversion_error", "audio_chunk"]
+        assert emitted[0][1] == {
+            "error": "conversion_failed",
+            "message": "Voice conversion failed; silence was emitted",
+            "action": "silence",
+        }
+        output = np.frombuffer(emitted[1][1], dtype=np.int16)
+        assert len(output) == 4
+        assert np.count_nonzero(output) == 0
+
+    def test_malformed_payload_emits_expected_silence(self):
+        """Malformed bytes are not reflected and use the configured frame count."""
+        converter = MagicMock()
+        converter.block_frame = 4
+        converter.input_sampling_rate = 44100
+        emitted = []
+
+        with (
+            patch("seed_vc.socketio.server.global_converter", converter),
+            patch("seed_vc.socketio.server.sio", self._mock_sio(emitted)),
+        ):
+            asyncio.run(audio_chunk("client1", b"raw voice"))
+
+        converter.audio_callback.assert_not_called()
+        assert [event for event, _, _ in emitted] == ["conversion_error", "audio_chunk"]
+        assert emitted[1][1] == bytes(4 * np.dtype(np.int16).itemsize)
+
+    def test_missing_converter_emits_silence(self):
+        """An uninitialized converter also fails closed."""
+        original = np.full(4, 1234, dtype=np.int16).tobytes()
+        emitted = []
+
+        with (
+            patch("seed_vc.socketio.server.global_converter", None),
+            patch("seed_vc.socketio.server.sio", self._mock_sio(emitted)),
+        ):
+            asyncio.run(audio_chunk("client1", original))
+
+        assert [event for event, _, _ in emitted] == ["conversion_error", "audio_chunk"]
+        assert emitted[1][1] == bytes(len(original))
 
 
 class TestLoadConverterConfig:

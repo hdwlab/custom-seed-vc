@@ -29,6 +29,7 @@ import yaml
 from fastapi import FastAPI
 from socketio.exceptions import ConnectionRefusedError as SocketIOConnectionRefused
 
+from seed_vc.socketio.offline_jobs import OfflineJobManager
 from seed_vc.socketio.runtime import ServerRuntimeCoordinator
 from seed_vc.socketio.schemas import (
     OFFLINE_BUSY_MESSAGE,
@@ -38,11 +39,13 @@ from seed_vc.socketio.schemas import (
     InvalidOperatorInfoError,
     MaxClientsReachedError,
     OfflineBusyError,
+    RealtimeConversionError,
 )
 from seed_vc.socketio.voice_presets import (
     VoicePresetError,
     VoicePresetStore,
     apply_preset_voice,
+    validate_voice_store_compatibility,
 )
 
 # Create logger instance
@@ -61,6 +64,7 @@ logger.info("🚀 Starting server imports...")
 logger.info("⏳ Importing seed_vc modules (this may take a while)...")
 from seed_vc.socketio.api import APIRouterVCModel  # noqa: E402
 from seed_vc.socketio.model import VoiceConverter  # noqa: E402
+from seed_vc.socketio.monitoring import create_monitoring_router  # noqa: E402
 
 logger.info("✅ All imports completed!")
 
@@ -420,23 +424,45 @@ async def audio_chunk(sid: str, data: bytes) -> None:
     # Get global converter
     converter = global_converter
 
-    if not converter:
-        logger.warning("⚠️ No converter available for %s, echoing original audio", sid)
-        await sio.emit("audio_chunk", data, to=sid)
-        return
-
     # Drop chunks from unregistered clients so that stale in-flight chunks
-    # never wait on the model lock held by an offline conversion job
+    # never wait on the model lock held by an offline conversion job.
     if not runtime.has_client(sid):
         logger.warning("⚠️ Dropping audio chunk for unregistered client: %s", sid)
+        runtime.record_dropped_chunk()
+        return
+
+    if not converter:
+        logger.error("❌ No converter available for %s; emitting silence", sid)
+        silence_frames = len(data) // np.dtype(np.int16).itemsize
+        if not data or len(data) % np.dtype(np.int16).itemsize:
+            silence_frames = 7938
+        error_data: RealtimeConversionError = {
+            "error": "conversion_failed",
+            "message": "Voice conversion failed; silence was emitted",
+            "action": "silence",
+        }
+        await sio.emit("conversion_error", error_data, to=sid)
+        await sio.emit("audio_chunk", np.zeros(silence_frames, dtype=np.int16).tobytes(), to=sid)
+        runtime.record_realtime_chunk(
+            processing_seconds=0.0,
+            audio_duration_seconds=silence_frames / 44100,
+            failed=True,
+        )
         return
 
     # Start timing for RTF calculation
     start_time = time.time()
+    expected_frames = converter.block_frame
+    audio_array = np.zeros(expected_frames, dtype=np.float32)
+    silence_frames = expected_frames
+    failed = False
 
     try:
+        if not data or len(data) % np.dtype(np.int16).itemsize:
+            raise ValueError(f"Invalid int16 audio payload size: {len(data)} bytes")
         # Convert bytes to numpy array (int16 -> float32, normalize to [-1, 1])
         audio_array = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+        silence_frames = len(audio_array)
 
         # Prepare for audio_callback (add channel dimension for sounddevice format)
         audio_2d = audio_array.reshape(-1, 1)  # Shape: (frames, channels)
@@ -446,6 +472,7 @@ async def audio_chunk(sid: str, data: bytes) -> None:
         with runtime.model_lock:
             if not runtime.has_client(sid):
                 logger.warning("⚠️ Dropping audio chunk for disconnected client: %s", sid)
+                runtime.record_dropped_chunk()
                 return
 
             # Clear previous output
@@ -463,12 +490,19 @@ async def audio_chunk(sid: str, data: bytes) -> None:
         processed_data = converted_int16.tobytes()
 
     except Exception as e:
-        logger.error("❌ Error processing audio for %s: %s", sid, e)
-        import traceback
-
-        traceback.print_exc()
-        # Fallback to echo
-        processed_data = data
+        failed = True
+        logger.exception("❌ Error processing audio for %s: %s", sid, e)
+        # Never return the input audio on a conversion failure. This server is
+        # used for voice anonymization, so a passthrough fallback would expose
+        # the original voice. Intentional passthrough remains available through
+        # ConversionMode.PASSTHROUGH.
+        processed_data = np.zeros(silence_frames, dtype=np.int16).tobytes()
+        error_data = {
+            "error": "conversion_failed",
+            "message": "Voice conversion failed; silence was emitted",
+            "action": "silence",
+        }
+        await sio.emit("conversion_error", error_data, to=sid)
 
     # Calculate processing time and RTF
     processing_time = time.time() - start_time
@@ -477,6 +511,7 @@ async def audio_chunk(sid: str, data: bytes) -> None:
     # Use converter's input sampling rate (should be 44100 Hz)
     sample_rate = converter.input_sampling_rate if converter else 44100
     audio_duration = len(audio_array) / sample_rate
+    runtime.record_realtime_chunk(processing_time, audio_duration, failed)
 
     # Warn if RTF is too slow
     warn_if_rtf_slow(sid, processing_time, audio_duration)
@@ -547,6 +582,7 @@ def main() -> None:
     if args.presets_dir is not None:
         logger.info("Loading voice presets from %s...", args.presets_dir)
         voice_store = VoicePresetStore(args.presets_dir)
+        validate_voice_store_compatibility(global_converter, voice_store)
         allowed_audio_dirs.append(args.presets_dir)
 
     # API router for VoiceConverter model, sharing the runtime state used by
@@ -559,14 +595,18 @@ def main() -> None:
         runtime=runtime,
         voice_store=voice_store,
     )
+    offline_job_manager = OfflineJobManager(runtime, global_converter)
+    api_router.attach_offline_job_manager(offline_job_manager)
 
     # Add the VoiceConverter API routes to FastAPI
     fastapi_app.include_router(api_router.api_router, prefix="/api/v1")
+    fastapi_app.include_router(create_monitoring_router(global_converter, runtime, MAX_CLIENT))
 
     # Create ASGI app combining FastAPI and Socket.IO
     app = socketio.ASGIApp(
         socketio_server=sio,
         other_asgi_app=fastapi_app,
+        on_shutdown=offline_job_manager.shutdown,
     )
 
     logger.info("🌟 Ready to accept connections!")

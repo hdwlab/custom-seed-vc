@@ -1,11 +1,13 @@
 """Tests for Socket.IO client connection error handling and queue behavior."""
 
+import argparse
 from unittest.mock import patch
 
+import pytest
 import socketio
 
 import seed_vc.socketio.client as client_module
-from seed_vc.socketio.client import on_connect_error, on_connection_error
+from seed_vc.socketio.client import on_connect_error, on_connection_error, on_conversion_error
 from seed_vc.socketio.schemas import ConnectionErrorType
 
 
@@ -55,6 +57,23 @@ class TestClientConnectionErrors:
         )
         assert client_module.connection_error_details["message"] == (
             "Maximum number of clients (1) already connected"
+        )
+
+    def test_conversion_error_is_logged(self):
+        """The client reports the server-side silence fallback."""
+        with patch("seed_vc.socketio.client.logger") as mock_logger:
+            on_conversion_error(
+                {
+                    "error": "conversion_failed",
+                    "message": "Voice conversion failed; silence was emitted",
+                    "action": "silence",
+                }
+            )
+
+        mock_logger.error.assert_called_once_with(
+            "Realtime conversion failed: %s (action=%s)",
+            "Voice conversion failed; silence was emitted",
+            "silence",
         )
 
     def test_connection_error_logging_chunk_size_mismatch(self, caplog):
@@ -282,3 +301,71 @@ class TestQueueDraining:
         chunk = client_module.play_q.get()
         assert client_module.play_q.qsize() <= client_module.MAX_QUEUE_SIZE
         assert chunk == b"only_chunk"
+
+
+class TestAudioDevices:
+    """Tests for audio device discovery and selection."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [("3", 3), (" 12 ", 12), ("USB Microphone", "USB Microphone")],
+    )
+    def test_parse_audio_device(self, value, expected):
+        """Numeric values become indices while names remain strings."""
+        assert client_module.parse_audio_device(value) == expected
+
+    def test_empty_audio_device_is_rejected(self):
+        """An empty device selector should fail parsing."""
+        with pytest.raises(argparse.ArgumentTypeError):
+            client_module.parse_audio_device("  ")
+
+    def test_list_devices_prints_and_exits(self, capsys):
+        """--list-devices does not attempt a server connection."""
+        with (
+            patch("seed_vc.socketio.client.sd.query_devices", return_value="0 Built-in\n1 USB"),
+            patch("seed_vc.socketio.client.sio") as mock_sio,
+            patch("sys.argv", ["client.py", "--list-devices"]),
+        ):
+            client_module.main()
+
+        assert capsys.readouterr().out == "0 Built-in\n1 USB\n"
+        mock_sio.connect.assert_not_called()
+
+    def test_validate_audio_devices_checks_explicit_selections(self):
+        """Selected devices are checked with the stream format."""
+        with (
+            patch("seed_vc.socketio.client.sd.check_input_settings") as check_input,
+            patch("seed_vc.socketio.client.sd.check_output_settings") as check_output,
+        ):
+            client_module.validate_audio_devices(3, "USB Headset", 44100)
+
+        check_input.assert_called_once_with(
+            device=3,
+            channels=1,
+            dtype="int16",
+            samplerate=44100,
+        )
+        check_output.assert_called_once_with(
+            device="USB Headset",
+            channels=1,
+            dtype="int16",
+            samplerate=44100,
+        )
+
+    def test_invalid_selected_device_stops_before_connect(self):
+        """An unsupported device configuration is rejected before networking."""
+        with (
+            patch(
+                "seed_vc.socketio.client.sd.check_input_settings",
+                side_effect=ValueError("unsupported sample rate"),
+            ),
+            patch("seed_vc.socketio.client.sio") as mock_sio,
+            patch("seed_vc.socketio.client.logger") as mock_logger,
+            patch("sys.argv", ["client.py", "--input-device", "3"]),
+        ):
+            client_module.main()
+
+        mock_sio.connect.assert_not_called()
+        mock_logger.error.assert_called_once()
+        assert mock_logger.error.call_args.args[0] == "Invalid audio device configuration: %s"
+        assert str(mock_logger.error.call_args.args[1]) == "unsupported sample rate"
