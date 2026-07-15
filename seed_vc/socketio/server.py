@@ -35,8 +35,14 @@ from seed_vc.socketio.schemas import (
     ChunkSizeMismatchError,
     ClientAudioConfig,
     ConnectionErrorType,
+    InvalidOperatorInfoError,
     MaxClientsReachedError,
     OfflineBusyError,
+)
+from seed_vc.socketio.voice_presets import (
+    VoicePresetError,
+    VoicePresetStore,
+    apply_preset_voice,
 )
 
 # Create logger instance
@@ -70,6 +76,7 @@ fastapi_app = FastAPI(
 # Global VoiceConverter instance (shared across all clients)
 global_converter: Optional[VoiceConverter] = None
 converter_lock = threading.Lock()
+voice_store: Optional[VoicePresetStore] = None
 
 # Shared runtime state for realtime/offline exclusion
 runtime = ServerRuntimeCoordinator()
@@ -80,6 +87,52 @@ converter_init_status: Dict[str, bool] = {}  # Track if initialization was attem
 
 # Maximum number of concurrent clients
 MAX_CLIENT = 1
+
+
+def _restore_model_voice(converter: VoiceConverter, restore_path: Optional[str]) -> None:
+    """Restore the model voice state after an operator voice session."""
+    try:
+        if restore_path is None:
+            converter.clear_reference_audio()
+        else:
+            converter.update_reference_audio(restore_path)
+    except Exception:
+        logger.exception("Failed to restore reference audio %s; clearing instead", restore_path)
+        try:
+            converter.clear_reference_audio()
+        except Exception:
+            logger.exception("Failed to clear reference audio")
+
+
+def _apply_operator_voice(
+    converter: VoiceConverter,
+    runtime: ServerRuntimeCoordinator,
+    presets: Optional[VoicePresetStore],
+    sid: str,
+    operator_id: str,
+    auth: ClientAudioConfig,
+) -> None:
+    """Resolve and apply an operator-specific preset voice."""
+    if presets is None:
+        raise VoicePresetError("Voice presets are not configured on this server")
+    preset = presets.resolve_preset(operator_id, auth.get("gender"), auth.get("preset_id"))
+
+    start_time = time.time()
+    with runtime.model_lock:
+        restore_path = converter.get_reference_audio_path()
+        try:
+            apply_preset_voice(converter, presets, preset, operator_id)
+        except Exception:
+            _restore_model_voice(converter, restore_path)
+            raise
+        runtime.begin_voice_session(sid, restore_path)
+    logger.info(
+        "Applied operator voice: operator=%s preset=%s vector_space=%s (%.1f ms)",
+        operator_id,
+        preset.preset_id,
+        presets.has_vector_space,
+        (time.time() - start_time) * 1000,
+    )
 
 
 @sio.event
@@ -145,6 +198,23 @@ async def connect(
     else:
         logger.warning("⚠️ Client %s connected without authentication data", sid)
 
+    if auth:
+        raw_operator_id = auth.get("operator_id")
+        has_operator_fields = auth.get("gender") is not None or auth.get("preset_id") is not None
+        invalid_message = None
+        if raw_operator_id is None and has_operator_fields:
+            invalid_message = "operator_id is required when gender or preset_id is given"
+        elif raw_operator_id is not None and (
+            not isinstance(raw_operator_id, str) or not raw_operator_id.strip()
+        ):
+            invalid_message = "operator_id must be a non-empty string"
+        if invalid_message is not None:
+            partial_error: InvalidOperatorInfoError = {
+                "error": ConnectionErrorType.INVALID_OPERATOR_INFO.value,
+                "message": invalid_message,
+            }
+            raise SocketIOConnectionRefused(partial_error)
+
     # Register the client, rejecting it when the server is fully occupied
     # or an offline conversion job is in progress
     error = runtime.try_register_client(sid, MAX_CLIENT)
@@ -169,6 +239,25 @@ async def connect(
         }
         raise SocketIOConnectionRefused(offline_error)
 
+    operator_id = auth.get("operator_id") if auth else None
+    if auth and operator_id is not None:
+        try:
+            if global_converter is None:
+                raise VoicePresetError("Voice converter is not initialized")
+            _apply_operator_voice(global_converter, runtime, voice_store, sid, operator_id, auth)
+        except Exception as e:
+            runtime.unregister_client(sid)
+            if isinstance(e, VoicePresetError):
+                message = str(e)
+            else:
+                logger.exception("Failed to apply operator voice for %s", sid)
+                message = "Failed to apply operator voice"
+            invalid_error: InvalidOperatorInfoError = {
+                "error": ConnectionErrorType.INVALID_OPERATOR_INFO.value,
+                "message": message,
+            }
+            raise SocketIOConnectionRefused(invalid_error) from e
+
     # Assign the global converter to this client
     with converter_lock:
         client_converters[sid] = global_converter
@@ -190,6 +279,11 @@ async def disconnect(sid: str) -> None:
         sid: Client session ID.
     """
     logger.info("🔌 Client disconnected: %s", sid)
+
+    with runtime.model_lock:
+        had_session, restore_path = runtime.end_voice_session(sid)
+        if had_session and global_converter is not None:
+            _restore_model_voice(global_converter, restore_path)
 
     runtime.unregister_client(sid)
 
@@ -418,6 +512,11 @@ def main() -> None:
         help="List of directories where audio files are allowed to be loaded from",
     )
     parser.add_argument(
+        "--presets-dir",
+        default=None,
+        help="Path to a voice presets directory (presets.yaml, audio/, spaces/)",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -442,14 +541,23 @@ def main() -> None:
         logger.error("❌ Failed to initialize VoiceConverter. Exiting...")
         return
 
+    global voice_store
+    voice_store = None
+    allowed_audio_dirs = list(args.allowed_audio_dirs)
+    if args.presets_dir is not None:
+        logger.info("Loading voice presets from %s...", args.presets_dir)
+        voice_store = VoicePresetStore(args.presets_dir)
+        allowed_audio_dirs.append(args.presets_dir)
+
     # API router for VoiceConverter model, sharing the runtime state used by
     # the Socket.IO handlers so that realtime clients and offline conversion
     # jobs exclude each other
     api_router = APIRouterVCModel(
         model=global_converter,
         log_level=args.log_level,
-        allowed_audio_dirs=args.allowed_audio_dirs,
+        allowed_audio_dirs=allowed_audio_dirs,
         runtime=runtime,
+        voice_store=voice_store,
     )
 
     # Add the VoiceConverter API routes to FastAPI

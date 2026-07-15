@@ -29,6 +29,12 @@ $ cd /path/to/custom-seed-vc/
 $ uv run python seed_vc/socketio/server.py
 ```
 
+main repo 側で作成した `presets/` を使う場合は `--presets-dir` を指定します。SeedVC 用の vector space は main repo の speaker-space builder で `spaces/seed_vc.npz` として作成してください。
+
+```bash
+$ uv run python seed_vc/socketio/server.py --presets-dir /path/to/presets
+```
+
 起動が完了すると次のようなメッセージが表示されます。
 ```bash
 $ uv run python seed_vc/socketio/server.py
@@ -49,6 +55,12 @@ Serverが起動していることを確認してから実行してください�
 ```bash
 $ cd /path/to/custom-seed-vc/
 $ uv run python seed_vc/socketio/client.py
+```
+
+operator ごとの voice preset を使う場合は `--operator-id` を指定します。`gender` 付き preset を用意している場合だけ `--gender female` / `--gender male` で候補を絞れます。
+
+```bash
+$ uv run python seed_vc/socketio/client.py --operator-id alice
 ```
 
 起動が完了して、Serverと接続できると次のようなメッセージが表示されます。
@@ -88,6 +100,11 @@ $ curl -X POST "http://localhost:5000/api/v1/reference" \
 # セキュリティの関係からデフォルトでは assets/examples/reference/ 以下の音声ファイルのみを指定できます。
 # 別のディレクトリの音声ファイルを指定したい場合は、server.pyを起動する際に、`--allowed-audio-dirs`オプションをつけて起動してください。
 $ uv run python seed_vc/socketio/server.py --allowed-audio-dirs /path/to/your/audio/dir
+```
+
+- Voice Preset の一覧
+```bash
+$ curl "http://localhost:5000/api/v1/presets"
 ```
 
 - 音声変換モデルの各種パラメータの変更

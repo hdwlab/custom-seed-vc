@@ -2,8 +2,11 @@
 
 import os
 import tempfile
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -83,6 +86,38 @@ class TestConfigEndpoint:
         assert data["block_time"] == 0.18
         # chunk_size must match the zc-aligned block_frame used in connection validation
         assert data["chunk_size"] == 7938
+
+
+class TestPresetsEndpoint:
+    """Test the voice presets listing endpoint."""
+
+    def test_get_presets_without_store_returns_404(self, test_client):
+        """GET /presets returns 404 when presets are not configured."""
+        response = test_client.get("/api/v1/presets")
+
+        assert response.status_code == 404
+
+    def test_get_presets_returns_manifest_entries(self, voice_converter):
+        """GET /presets returns preset IDs, genders, and vector-space status."""
+        store = SimpleNamespace(
+            has_vector_space=True,
+            list_presets=lambda: [
+                SimpleNamespace(preset_id="p1", gender="female"),
+                SimpleNamespace(preset_id="p2", gender=None),
+            ],
+        )
+        api_router = APIRouterVCModel(model=voice_converter, voice_store=store)
+        app = FastAPI()
+        app.include_router(api_router.api_router, prefix="/api/v1")
+        client = TestClient(app)
+
+        response = client.get("/api/v1/presets")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "presets": [{"id": "p1", "gender": "female"}, {"id": "p2", "gender": None}],
+            "has_vector_space": True,
+        }
 
 
 class TestConversionModeEndpoint:
@@ -225,6 +260,55 @@ class TestReferenceAudioEndpoint:
             # This should work since the file is in allowed directory
             response = test_client.post("/api/v1/reference", json={"file_path": test_file})
             assert response.status_code == 200
+
+
+class TestSpeakerVectorHooks:
+    """Test SeedVC speaker vector hook behavior."""
+
+    def _set_reference_conditions(self, converter):
+        converter.reference_wav_path = "/tmp/reference.wav"
+        converter.reference_wav = np.zeros(16000, dtype=np.float32)
+        converter.reference_wav_name = "/tmp/reference.wav"
+        converter.prompt_len = converter.max_prompt_length
+        converter.prompt_condition = torch.zeros(1, 1, 4)
+        converter.mel2 = torch.zeros(1, 80, 1)
+        converter.style2 = torch.zeros(1, 4)
+
+    def test_get_speaker_vector_returns_copy(self, voice_converter):
+        """get_speaker_vector returns a detached 1-D float32 copy."""
+        self._set_reference_conditions(voice_converter)
+
+        vec = voice_converter.get_speaker_vector()
+
+        assert vec.shape == (4,)
+        assert vec.dtype == np.float32
+        vec[0] = 99.0
+        assert voice_converter.style2[0, 0].item() == 0.0
+
+    def test_update_speaker_vector_sets_style_and_resets_buffers(self, voice_converter):
+        """update_speaker_vector replaces style2 and reinitializes buffers."""
+        self._set_reference_conditions(voice_converter)
+        voice_converter.block_frame = -1
+
+        voice_converter.update_speaker_vector(np.array([1, 2, 3, 4], dtype=np.float32))
+
+        assert torch.equal(voice_converter.style2, torch.tensor([[1.0, 2.0, 3.0, 4.0]]))
+        assert voice_converter.block_frame == 7938
+
+    def test_update_speaker_vector_dimension_mismatch_raises(self, voice_converter):
+        """update_speaker_vector validates the current style vector dimension."""
+        self._set_reference_conditions(voice_converter)
+
+        with pytest.raises(ValueError, match="dimension"):
+            voice_converter.update_speaker_vector(np.zeros(3, dtype=np.float32))
+
+    def test_update_speaker_vector_without_reference_raises(self, voice_converter):
+        """update_speaker_vector requires reference audio."""
+        voice_converter.reference_wav = None
+        voice_converter.reference_wav_path = None
+
+        with pytest.raises(RuntimeError, match="Reference audio not set"):
+            voice_converter.update_speaker_vector(np.zeros(4, dtype=np.float32))
 
 
 class TestModelParametersEndpoint:

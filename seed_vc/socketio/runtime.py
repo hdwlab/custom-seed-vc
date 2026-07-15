@@ -31,6 +31,8 @@ class ServerRuntimeCoordinator:
         self._state_lock = threading.Lock()
         self._active_client_sids: set = set()
         self._offline_job_active = False
+        self._voice_session_sid: Optional[str] = None
+        self._voice_session_restore_path: Optional[str] = None
 
     def client_count(self) -> int:
         """Return the number of active Socket.IO clients."""
@@ -94,3 +96,28 @@ class ServerRuntimeCoordinator:
         """Return whether an offline conversion job is currently active."""
         with self._state_lock:
             return self._offline_job_active
+
+    def begin_voice_session(self, sid: str, restore_path: Optional[str]) -> None:
+        """Record an applied operator voice session.
+
+        Must be called while holding model_lock in the same critical section as
+        the model voice application.
+        """
+        with self._state_lock:
+            self._voice_session_sid = sid
+            self._voice_session_restore_path = restore_path
+
+    def end_voice_session(self, sid: str) -> tuple[bool, Optional[str]]:
+        """Clear and return the restore path when the SID owns the voice session."""
+        with self._state_lock:
+            if self._voice_session_sid != sid:
+                return False, None
+            restore_path = self._voice_session_restore_path
+            self._voice_session_sid = None
+            self._voice_session_restore_path = None
+            return True, restore_path
+
+    def voice_session_active(self) -> bool:
+        """Return whether an operator voice session currently owns the model voice."""
+        with self._state_lock:
+            return self._voice_session_sid is not None

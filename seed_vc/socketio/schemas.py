@@ -28,6 +28,7 @@ class ConnectionErrorType(Enum):
     CHUNK_SIZE_MISMATCH = "chunk_size_mismatch"
     MAX_CLIENTS_REACHED = "max_clients_reached"
     OFFLINE_BUSY = "offline_busy"
+    INVALID_OPERATOR_INFO = "invalid_operator_info"
 
 
 OFFLINE_BUSY_MESSAGE = "Offline conversion is already in progress. Please try again later."
@@ -57,15 +58,33 @@ class OfflineBusyError(TypedDict):
     message: str
 
 
-class ClientAudioConfig(TypedDict):
-    """Audio configuration sent from client to server during connection."""
+class InvalidOperatorInfoError(TypedDict):
+    """Error details for invalid operator voice information."""
+
+    error: str
+    message: str
+
+
+class ClientAudioConfig(TypedDict, total=False):
+    """Audio configuration sent from client to server during connection.
+
+    Optional operator fields request an operator-specific target voice.
+    """
 
     chunk_size: int
     sample_rate: int
+    operator_id: str
+    gender: str
+    preset_id: str
 
 
 # Union type for all connection error types
-ConnectionError = Union[ChunkSizeMismatchError, MaxClientsReachedError, OfflineBusyError]
+ConnectionError = Union[
+    ChunkSizeMismatchError,
+    MaxClientsReachedError,
+    OfflineBusyError,
+    InvalidOperatorInfoError,
+]
 
 
 # API Request Models

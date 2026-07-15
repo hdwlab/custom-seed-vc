@@ -633,6 +633,72 @@ class VoiceConverter:
 
         return semantic_fn
 
+    def _clear_reference_cache(self) -> None:
+        """Clear cached reference conditions to force regeneration."""
+        self.prompt_condition = None
+        self.mel2 = None
+        self.style2 = None
+        self.reference_wav_name = ""
+
+    def _reference_condition_needs_update(
+        self, reference_wav_name: str, max_prompt_length: float
+    ) -> bool:
+        """Return whether cached reference conditions need to be rebuilt."""
+        return (
+            self.prompt_condition is None
+            or self.mel2 is None
+            or self.style2 is None
+            or self.reference_wav_name != reference_wav_name
+            or self.prompt_len != max_prompt_length
+        )
+
+    @torch.no_grad()
+    def _ensure_reference_conditions(
+        self,
+        reference_wav: np.ndarray,
+        reference_wav_name: str,
+        max_prompt_length: float,
+    ) -> None:
+        """Build prompt, mel, and speaker style conditions for reference audio."""
+        if not self._reference_condition_needs_update(reference_wav_name, max_prompt_length):
+            return
+
+        (
+            model,
+            semantic_fn,
+            _vocoder_fn,
+            campplus_model,
+            to_mel,
+            mel_fn_args,
+        ) = self.model_set
+        sr = mel_fn_args["sampling_rate"]
+        self.prompt_len = max_prompt_length
+        self.logger.info("ℹ️ Setting max prompt length to %s seconds", max_prompt_length)
+        reference_wav = reference_wav[: int(sr * self.prompt_len)]
+        reference_wav_tensor = torch.from_numpy(reference_wav).to(self.device)
+
+        ori_waves_16k = torchaudio.functional.resample(reference_wav_tensor, sr, 16000)
+        S_ori = semantic_fn(ori_waves_16k.unsqueeze(0))
+        feat2 = torchaudio.compliance.kaldi.fbank(
+            ori_waves_16k.unsqueeze(0),
+            num_mel_bins=80,
+            dither=0,
+            sample_frequency=16000,
+        )
+        feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
+        self.style2 = campplus_model(feat2.unsqueeze(0))
+
+        self.mel2 = to_mel(reference_wav_tensor.unsqueeze(0))
+        target2_lengths = torch.LongTensor([self.mel2.size(2)]).to(self.mel2.device)
+        self.prompt_condition = model.length_regulator(
+            S_ori,
+            ylens=target2_lengths,
+            n_quantizers=3,
+            f0=None,
+        )[0]
+
+        self.reference_wav_name = reference_wav_name
+
     @torch.no_grad()
     def custom_infer(
         self,
@@ -670,8 +736,8 @@ class VoiceConverter:
             model,
             semantic_fn,
             vocoder_fn,
-            campplus_model,
-            to_mel,
+            _campplus_model,
+            _to_mel,
             mel_fn_args,
         ) = self.model_set
         sr = mel_fn_args["sampling_rate"]
@@ -681,37 +747,7 @@ class VoiceConverter:
             self.ce_dit_difference = cd_difference
             self.logger.info("ℹ️ Setting ce_dit_difference to %s seconds", cd_difference)
 
-        if (
-            self.prompt_condition is None
-            or self.reference_wav_name != new_reference_wav_name
-            or self.prompt_len != max_prompt_length
-        ):
-            self.prompt_len = max_prompt_length
-            self.logger.info("ℹ️ Setting max prompt length to %s seconds", max_prompt_length)
-            reference_wav = reference_wav[: int(sr * self.prompt_len)]
-            reference_wav_tensor = torch.from_numpy(reference_wav).to(self.device)
-
-            ori_waves_16k = torchaudio.functional.resample(reference_wav_tensor, sr, 16000)
-            S_ori = semantic_fn(ori_waves_16k.unsqueeze(0))
-            feat2 = torchaudio.compliance.kaldi.fbank(
-                ori_waves_16k.unsqueeze(0),
-                num_mel_bins=80,
-                dither=0,
-                sample_frequency=16000,
-            )
-            feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
-            self.style2 = campplus_model(feat2.unsqueeze(0))
-
-            self.mel2 = to_mel(reference_wav_tensor.unsqueeze(0))
-            target2_lengths = torch.LongTensor([self.mel2.size(2)]).to(self.mel2.device)
-            self.prompt_condition = model.length_regulator(
-                S_ori,
-                ylens=target2_lengths,
-                n_quantizers=3,
-                f0=None,
-            )[0]
-
-            self.reference_wav_name = new_reference_wav_name
+        self._ensure_reference_conditions(reference_wav, new_reference_wav_name, max_prompt_length)
 
         converted_waves_16k = input_wav_res
         start_event, end_event = self._create_timing_events()
@@ -982,6 +1018,87 @@ class VoiceConverter:
             processing_time_sec,
             audio_duration_sec,
         )
+
+    def update_reference_audio(self, file_path: str) -> dict:
+        """Update reference audio and clear dependent cached conditions.
+
+        Args:
+            file_path: Path to the reference audio file.
+
+        Returns:
+            Reference update metadata.
+        """
+        sampling_rate = self.model_set[-1]["sampling_rate"]
+        reference_wav, _ = librosa.load(file_path, sr=sampling_rate)
+        self.reference_wav_path = file_path
+        self.reference_wav = reference_wav
+        self._clear_reference_cache()
+        self._init_buffers()
+        return {
+            "message": "Reference audio updated successfully",
+            "reference_path": file_path,
+            "sampling_rate": sampling_rate,
+            "audio_duration": len(reference_wav) / sampling_rate,
+        }
+
+    def get_reference_audio_path(self) -> Optional[str]:
+        """Return the currently configured reference audio path, if any."""
+        return self.reference_wav_path
+
+    def clear_reference_audio(self) -> None:
+        """Clear reference audio and reset conversion buffers."""
+        self.reference_wav_path = None
+        self.reference_wav = None
+        self._clear_reference_cache()
+        self._init_buffers()
+
+    def get_speaker_vector(self) -> np.ndarray:
+        """Return the current SeedVC speaker style vector as a 1-D float32 copy.
+
+        Raises:
+            RuntimeError: If no reference audio has been set.
+        """
+        if self.reference_wav is None or self.reference_wav_path is None:
+            raise RuntimeError("Reference audio not set. Call update_reference_audio() first.")
+        self._ensure_reference_conditions(
+            self.reference_wav,
+            self.reference_wav_path,
+            self.max_prompt_length,
+        )
+        if self.style2 is None:
+            raise RuntimeError("Reference audio not set. Call update_reference_audio() first.")
+        return self.style2.detach().cpu().numpy().astype(np.float32).reshape(-1)
+
+    def update_speaker_vector(self, vector: np.ndarray) -> None:
+        """Override the SeedVC speaker style vector independently of reference audio.
+
+        Args:
+            vector: Speaker vector as a 1-D array.
+
+        Raises:
+            RuntimeError: If no reference audio has been set.
+            ValueError: If the dimension differs from the current style vector.
+        """
+        if self.reference_wav is None or self.reference_wav_path is None:
+            raise RuntimeError("Reference audio not set. Call update_reference_audio() first.")
+        self._ensure_reference_conditions(
+            self.reference_wav,
+            self.reference_wav_path,
+            self.max_prompt_length,
+        )
+        if self.style2 is None:
+            raise RuntimeError("Reference audio not set. Call update_reference_audio() first.")
+        vec = np.asarray(vector, dtype=np.float32).reshape(-1)
+        if vec.size != self.style2.numel():
+            raise ValueError(
+                f"Speaker vector dimension mismatch: expected {self.style2.numel()}, got {vec.size}"
+            )
+        self.style2 = (
+            torch.from_numpy(vec.copy())
+            .reshape(tuple(self.style2.shape))
+            .to(device=self.style2.device, dtype=self.style2.dtype)
+        )
+        self._init_buffers()
 
     def convert_file(self, input_path: str, output_path: str) -> dict:
         """Convert an entire audio file offline by streaming it block by block.

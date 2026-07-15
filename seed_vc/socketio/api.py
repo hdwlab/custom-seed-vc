@@ -19,6 +19,7 @@
 import logging
 import tempfile
 import threading
+from collections.abc import Mapping
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
@@ -38,6 +39,7 @@ from seed_vc.socketio.schemas import (
     ModelReloadRequest,
     ReferenceAudioRequest,
 )
+from seed_vc.socketio.voice_presets import VoicePresetStore
 
 logger = logging.getLogger(__name__)
 logger.propagate = False
@@ -140,6 +142,7 @@ class APIRouterVCModel:
         log_level: str = "INFO",
         client_count_checker: Optional[Callable[[], int]] = None,
         runtime: Optional[ServerRuntimeCoordinator] = None,
+        voice_store: Optional[VoicePresetStore] = None,
     ) -> None:
         """Initialize the API router with the given VoiceConverter model.
 
@@ -153,6 +156,7 @@ class APIRouterVCModel:
                 otherwise no client connection checking will be performed.
             runtime: Runtime state shared with the Socket.IO event handlers.
                 If None, a private coordinator is created.
+            voice_store: Optional voice preset store shared with Socket.IO handlers.
         """
         # Configure logger level for this instance
         numeric_level = getattr(logging, log_level.upper(), None)
@@ -168,6 +172,7 @@ class APIRouterVCModel:
         if client_count_checker is None and runtime is not None:
             client_count_checker = runtime.client_count
         self.client_count_checker = client_count_checker
+        self.voice_store = voice_store
 
         # Set allowed directories for audio files
         if allowed_audio_dirs is None:
@@ -186,6 +191,11 @@ class APIRouterVCModel:
         self.api_router.add_api_route(
             "/config",
             self.get_config,
+            methods=["GET"],
+        )
+        self.api_router.add_api_route(
+            "/presets",
+            self.get_presets,
             methods=["GET"],
         )
         self.api_router.add_api_route(
@@ -324,6 +334,24 @@ class APIRouterVCModel:
             status_code=200,
         )
 
+    def get_presets(self) -> JSONResponse:
+        """List available voice presets.
+
+        Raises:
+            HTTPException: If voice presets are not configured.
+        """
+        if self.voice_store is None:
+            raise HTTPException(status_code=404, detail="Voice presets are not configured")
+        return JSONResponse(
+            content={
+                "presets": [
+                    {"id": p.preset_id, "gender": p.gender} for p in self.voice_store.list_presets()
+                ],
+                "has_vector_space": self.voice_store.has_vector_space,
+            },
+            status_code=200,
+        )
+
     def update_reference_audio(self, request: ReferenceAudioRequest) -> JSONResponse:
         """Update the reference audio for voice conversion.
 
@@ -342,34 +370,58 @@ class APIRouterVCModel:
         validated_file_path = self._validate_file_path(request.file_path)
 
         try:
-            # Load outside the lock so realtime audio processing is not stalled
-            reference_wav, _ = librosa.load(
-                validated_file_path,
-                sr=self.model.model_set[-1]["sampling_rate"],
-            )
-
-            # Thread-safe update of model's reference audio and cache
             with self.model_lock:
-                self._apply_reference_audio(validated_file_path, reference_wav)
+                self._reject_if_voice_session_active()
+                result = self._update_model_reference_audio(validated_file_path)
 
-            duration = len(reference_wav) / self.model.model_set[-1]["sampling_rate"]
-            self.logger.info("✅ API: Reference audio updated successfully (%.2fs)", duration)
-
-            return JSONResponse(
-                content={
-                    "message": "Reference audio updated successfully",
-                    "reference_path": validated_file_path,
-                    "sampling_rate": self.model.model_set[-1]["sampling_rate"],
-                    "audio_duration": duration,
-                },
-                status_code=200,
+            self.logger.info(
+                "✅ API: Reference audio updated successfully (%.2fs)",
+                result["audio_duration"],
             )
 
+            return JSONResponse(content=result, status_code=200)
+
+        except HTTPException:
+            raise
         except Exception as e:
             self.logger.error("❌ API: Failed to load audio file: %s", str(e))
             raise HTTPException(
                 status_code=500, detail=f"Failed to load audio file: {str(e)}"
             ) from e
+
+    def _update_model_reference_audio(self, file_path: str) -> dict:
+        """Update reference audio through the model hook or legacy API logic.
+
+        Must be called while holding self.model_lock.
+        """
+        update_reference_audio = getattr(self.model, "update_reference_audio", None)
+        if callable(update_reference_audio):
+            result = update_reference_audio(file_path)
+            if isinstance(result, Mapping):
+                return dict(result)
+
+        reference_wav, _ = librosa.load(
+            file_path,
+            sr=self.model.model_set[-1]["sampling_rate"],
+        )
+        self._apply_reference_audio(file_path, reference_wav)
+        sampling_rate = self.model.model_set[-1]["sampling_rate"]
+        return {
+            "message": "Reference audio updated successfully",
+            "reference_path": file_path,
+            "sampling_rate": sampling_rate,
+            "audio_duration": len(reference_wav) / sampling_rate,
+        }
+
+    def _reject_if_voice_session_active(self) -> None:
+        """Raise 409 while an operator voice session owns the model voice state."""
+        if self.runtime.voice_session_active():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Cannot modify the model voice state while an operator voice session is active"
+                ),
+            )
 
     def _clear_reference_cache(self) -> None:
         """Clear the model's cached reference values to force regeneration.
@@ -607,10 +659,12 @@ class APIRouterVCModel:
             )
 
         # Update conversion mode
-        for mode in ConversionMode:
-            if mode.value == mode_str:
-                self.model.conversion_mode = mode
-                break
+        with self.model_lock:
+            self._reject_if_voice_session_active()
+            for mode in ConversionMode:
+                if mode.value == mode_str:
+                    self.model.conversion_mode = mode
+                    break
 
         self.logger.info("✅ API: Conversion mode updated to %s", self.model.conversion_mode.value)
 

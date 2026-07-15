@@ -141,6 +141,36 @@ class TestClientConnectionErrors:
                     ]
                     assert len(wait_calls) > 0
 
+    def test_operator_auth_fields_are_sent(self):
+        """CLI operator options are added to the Socket.IO auth payload."""
+        with patch("seed_vc.socketio.client.sio") as mock_sio:
+            mock_sio.connect.side_effect = socketio.exceptions.ConnectionError("Connection failed")
+
+            from seed_vc.socketio.client import main
+
+            with patch(
+                "sys.argv",
+                [
+                    "client.py",
+                    "--operator-id",
+                    "alice",
+                    "--gender",
+                    "female",
+                    "--preset-id",
+                    "preset_a",
+                ],
+            ):
+                main()
+
+        _args, kwargs = mock_sio.connect.call_args
+        assert kwargs["auth"] == {
+            "chunk_size": client_module.CHUNK_SIZE,
+            "sample_rate": client_module.SAMPLE_RATE,
+            "operator_id": "alice",
+            "gender": "female",
+            "preset_id": "preset_a",
+        }
+
     def test_unknown_error_handling(self):
         """Test that unknown errors are handled gracefully."""
         error_data = {"error": "unknown_error", "message": "Some unknown error occurred"}

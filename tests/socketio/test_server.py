@@ -15,6 +15,7 @@ from seed_vc.socketio.server import (
     converter_init_status,
     disconnect,
 )
+from seed_vc.socketio.voice_presets import VoicePreset
 
 
 class TestServerConnectionLimits:
@@ -26,6 +27,7 @@ class TestServerConnectionLimits:
         client_converters.clear()
         converter_init_status.clear()
         server_module.runtime = ServerRuntimeCoordinator()
+        server_module.voice_store = None
 
     def test_single_client_connection_allowed(self):
         """Test that a single client can connect successfully."""
@@ -226,6 +228,7 @@ class TestOfflineJobConnectionExclusion:
         client_converters.clear()
         converter_init_status.clear()
         server_module.runtime = ServerRuntimeCoordinator()
+        server_module.voice_store = None
 
     def test_connection_rejected_while_offline_job_active(self):
         """Test that a client is rejected while an offline conversion job is active."""
@@ -334,3 +337,81 @@ class TestInitializeGlobalConverterWithConfig:
         assert kwargs["block_time"] == 0.18
         assert kwargs["use_vad"] is True
         assert kwargs["log_level"] == "DEBUG"
+
+
+class TestOperatorVoicePresets:
+    """Test cases for operator voice preset application."""
+
+    def setup_method(self):
+        """Setup server state before each test."""
+        client_converters.clear()
+        converter_init_status.clear()
+        server_module.runtime = ServerRuntimeCoordinator()
+        server_module.voice_store = None
+
+    def test_operator_fields_without_operator_id_are_rejected(self):
+        """Gender or preset_id requires operator_id."""
+        converter = MagicMock()
+        converter.block_time = 0.18
+        converter.block_frame = 7938
+
+        with patch("seed_vc.socketio.server.MAX_CLIENT", 1):
+            with patch("seed_vc.socketio.server.global_converter", converter):
+                auth = {"chunk_size": 7938, "sample_rate": 44100, "gender": "female"}
+
+                with pytest.raises(SocketIOConnectionRefused) as exc_info:
+                    asyncio.run(connect("client1", {}, auth))
+
+        error_data = exc_info.value.args[0]
+        assert error_data["error"] == ConnectionErrorType.INVALID_OPERATOR_INFO.value
+        assert "operator_id is required" in error_data["message"]
+        assert "client1" not in client_converters
+
+    def test_operator_id_without_voice_store_is_rejected_and_unregisters(self):
+        """An operator voice request fails clearly when presets are not configured."""
+        converter = MagicMock()
+        converter.block_time = 0.18
+        converter.block_frame = 7938
+
+        with patch("seed_vc.socketio.server.MAX_CLIENT", 1):
+            with patch("seed_vc.socketio.server.global_converter", converter):
+                auth = {"chunk_size": 7938, "sample_rate": 44100, "operator_id": "alice"}
+
+                with pytest.raises(SocketIOConnectionRefused) as exc_info:
+                    asyncio.run(connect("client1", {}, auth))
+
+        error_data = exc_info.value.args[0]
+        assert error_data["error"] == ConnectionErrorType.INVALID_OPERATOR_INFO.value
+        assert "Voice presets are not configured" in error_data["message"]
+        assert "client1" not in client_converters
+        assert server_module.runtime.client_count() == 0
+
+    def test_operator_voice_is_applied_and_restored_on_disconnect(self):
+        """A preset voice session restores the previous reference on disconnect."""
+        converter = MagicMock()
+        converter.block_time = 0.18
+        converter.block_frame = 7938
+        converter.get_reference_audio_path.return_value = "/before.wav"
+        store = MagicMock()
+        store.has_vector_space = False
+        store.resolve_preset.return_value = VoicePreset(
+            preset_id="preset_a",
+            gender=None,
+            audio_path="/preset.wav",
+        )
+        server_module.voice_store = store
+
+        with (
+            patch("seed_vc.socketio.server.MAX_CLIENT", 1),
+            patch("seed_vc.socketio.server.global_converter", converter),
+            patch("seed_vc.socketio.server.apply_preset_voice") as mock_apply,
+        ):
+            auth = {"chunk_size": 7938, "sample_rate": 44100, "operator_id": "alice"}
+
+            assert asyncio.run(connect("client1", {}, auth)) is True
+            asyncio.run(disconnect("client1"))
+
+        store.resolve_preset.assert_called_once_with("alice", None, None)
+        mock_apply.assert_called_once()
+        converter.update_reference_audio.assert_called_once_with("/before.wav")
+        assert "client1" not in client_converters

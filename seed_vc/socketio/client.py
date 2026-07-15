@@ -168,6 +168,22 @@ def main() -> None:
         help="Server port number",
     )
     parser.add_argument(
+        "--operator-id",
+        default=None,
+        help="Operator ID used for deterministic voice preset assignment",
+    )
+    parser.add_argument(
+        "--gender",
+        default=None,
+        choices=["male", "female"],
+        help="Optional preset gender filter",
+    )
+    parser.add_argument(
+        "--preset-id",
+        default=None,
+        help="Explicit voice preset ID to use",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -186,6 +202,12 @@ def main() -> None:
 
     # Send chunk size and sample rate for validation
     auth_data: ClientAudioConfig = {"chunk_size": args.chunk_size, "sample_rate": SAMPLE_RATE}
+    if args.operator_id is not None:
+        auth_data["operator_id"] = args.operator_id
+    if args.gender is not None:
+        auth_data["gender"] = args.gender
+    if args.preset_id is not None:
+        auth_data["preset_id"] = args.preset_id
 
     try:
         sio.connect(url, auth=auth_data)
@@ -214,6 +236,11 @@ def main() -> None:
                 ),
             )
             logger.error("Please wait for another client to disconnect, or try connecting later.")
+        elif error_type == ConnectionErrorType.INVALID_OPERATOR_INFO.value:
+            logger.error(
+                "❌ Invalid operator voice request: %s",
+                connection_error_details.get("message", "invalid operator information"),
+            )
         else:
             # No specific error details from server
             if not connection_error_details:
