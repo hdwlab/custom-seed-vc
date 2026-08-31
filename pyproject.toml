@@ -43,7 +43,7 @@ dependencies = [
     "matplotlib>=3.10.3,<4",
     "descript-audio-codec>=1.0.0,<1.1",
     "descript-audiotools",
-    "onnx>=1.18.0,<2",
+    "onnx>=1.22.0,<2",
     # NOTE: onnxruntime>=1.24 drops python 3.10 wheels
     "onnxruntime>=1.21.1,<1.24",
     "tensorboard>=2.20.0,<3",
